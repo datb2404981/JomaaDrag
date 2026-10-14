@@ -48,8 +48,8 @@ static int (*MTDeviceIsRunning)(MTDeviceRef);
 #define BUILTIN_ID 144115188075855923ULL
 #define MAGIC 0x4A4D44LL // 'JMD'
 
-// Cấu hình nhận diện & điều khiển
-static const double SPEED_FACTOR = 1400.0;
+// ĐÃ NÂNG TỐC ĐỘ KÉO 3 NGÓN TỪ 1400 LÊN 2350 (Nhanh, nhẹ và thoát tay hơn hẳn)
+static const double SPEED_FACTOR = 2350.0;
 
 // Hệ số độ nhạy động
 static _Atomic double sensitivityMultiplier = 1.0;
@@ -81,7 +81,7 @@ static _Atomic int dragging = 0;
 static volatile sig_atomic_t stopRequested = 0;
 
 static double lastTouchT = 0.0;
-static double lastDragContactT = 0.0; // Thời điểm cuối cùng có >= 2 ngón tay giữ phiên kéo
+static double lastDragContactT = 0.0;
 static double singleFingerSinceT = 0.0;
 static double singleFingerStartX = 0.0;
 static double singleFingerStartY = 0.0;
@@ -89,7 +89,7 @@ static double armSince = 0.0;
 static int latestPresent = 0;
 static double tRef = 0.0;
 
-// Vị trí con trỏ & Bộ đệm Nội suy Kéo 3 ngón 120Hz (Silky 120Hz Drag Buffer)
+// Vị trí con trỏ & Bộ đệm Nội suy Kéo 3 ngón 120Hz
 static double curX = 0.0, curY = 0.0;
 static double dragTargetDx = 0.0, dragTargetDy = 0.0;
 static double prevDragCentroidX = 0.0;
@@ -188,14 +188,12 @@ static void stopMosScrollImmediately(int cancelTouchPhase) {
     mosPeakVelPerTick = 0.0;
 }
 
-// Phát sự kiện Kéo 3 ngón chuẩn giao thức WindowServer (Chạy ngoài Mutex ở tần số 120Hz):
 static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy) {
     CGEventSourceRef src = sharedHIDSource();
     if (type == kCGEventLeftMouseDown) {
         dragEventNumber++;
     }
 
-    // Đồng bộ vị trí con trỏ hệ thống và xóa ngay lập tức khoảng trễ 250ms của macOS:
     CGWarpMouseCursorPosition(p);
     CGAssociateMouseAndMouseCursorPosition(true);
 
@@ -250,7 +248,6 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     }
     if (!event) return event;
 
-    // 1. Cho qua ngay lập tức các sự kiện do JomaaDrag phát ra
     int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
     if (userData == MAGIC) return event;
 
@@ -260,15 +257,12 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     double elapsedAny = now - atomic_load_explicit(&lastAnyJomaaTouchT, memory_order_relaxed);
     int isMultiTouch = atomic_load_explicit(&multiTouchActive, memory_order_relaxed) && (elapsedMulti < 65.0);
 
-    // 2. Chặn gói cuộn răng cưa phần cứng của Jomaa
     if (type == kCGEventScrollWheel) {
         if (isMultiTouch || isDragging || elapsedAny < 300.0) {
             return NULL;
         }
     }
 
-    // 3. Khi đang cuộn 2 ngón HOẶC đang kéo 3 ngón:
-    // Chặn tuyệt đối tín hiệu chuột phần cứng của Jomaa để không làm lệch con trỏ khỏi thanh tiêu đề
     if (isMultiTouch || isDragging) {
         if (type == kCGEventMouseMoved ||
             type == kCGEventLeftMouseDragged ||
@@ -359,8 +353,6 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
 
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
 
-    // Nếu đang trong phiên kéo 3 ngón mà người dùng chuyển sang dùng 1 NGÓN TAY để di chuột:
-    // Kiểm tra nếu chỉ có 1 ngón chạm và di chuyển >= 1.0px (sau 20ms) -> Nhả kéo ngay tức khắc để 1 ngón di chuột!
     if (isDragging) {
         if (currCount >= 2) {
             lastDragContactT = tn;
@@ -445,7 +437,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             armSince = 0.0;
         }
 
-        // --- 2. THUẬT TOÁN CUỘN MƯỢT 2 NGÓN ---
+        // --- 2. THUẬT TOÁN CUỘN MƯỢT 2 NGÓN (GIỮ NGUYÊN ĐỘ ĐẦM VỪA PHẢI) ---
         double timeSinceTwoFingers = tn - lastTwoFingerT;
         int isTwoFingerScroll = 0;
 
@@ -521,8 +513,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             }
         }
     } else {
-        // --- 3. ĐANG TRONG PHIÊN KÉO 3 NGÓN (DÙNG CLUSTER CENTROID + BỘ ĐỆM NỘI SUY 120Hz) ---
-        // Miễn nhiễm 100% với hiện tượng nhảy/đổi ID ngón tay của chip Jomaa khi chụm 3 ngón!
+        // --- 3. ĐANG TRONG PHIÊN KÉO 3 NGÓN (TĂNG TỐC & GIA TỐC NHẠY BÉN) ---
         if (currCount >= 2) {
             double sumX = 0.0, sumY = 0.0;
             for (int i = 0; i < currCount; i++) {
@@ -542,17 +533,14 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                 double rawDy = -(curCentroidY - prevDragCentroidY) * effectiveSpeed;
 
                 double dist = hypot(rawDx, rawDy);
-                // Lọc bỏ nhiễu nhảy tọa độ bất thường nhưng giữ nguyên mọi chuyển động kéo thật
-                if (dist < 140.0 && dist > 0.02) {
-                    // Gia tốc nhẹ khi kéo nhanh giúp vượt toàn màn hình dễ dàng trên bàn rê nhỏ của Jomaa
-                    double dragGain = 1.0 + fmin(dist * 0.015, 0.45);
+                if (dist < 220.0 && dist > 0.02) {
+                    // Gia tốc lũy tiến: di chậm đi chính xác (1.0x), lướt nhanh tăng vọt lên tới 2.30x!
+                    double dragGain = 1.0 + fmin(dist * 0.035, 1.30);
                     dragTargetDx += rawDx * dragGain;
                     dragTargetDy += rawDy * dragGain;
                 }
             }
 
-            // Nếu người dùng hơi nhấc 1 ngón (từ 3 xuống 2) hoặc đặt lại ngón thứ 3 (từ 2 lên 3):
-            // Chỉ cập nhật lại mốc trọng tâm mới mà KHÔNG tạo bước nhảy giả, giúp kéo liên tục không bao giờ đứt!
             prevDragCentroidX = curCentroidX;
             prevDragCentroidY = curCentroidY;
             prevDragFingerCount = currCount;
@@ -590,7 +578,7 @@ static void stopDrag(const char *why) {
 }
 
 // ============================================================================
-// VÒNG LẶP NỘI SUY 120Hz (8.33ms TICK - MƯỢT CẢ CUỘN 2 NGÓN LẪN KÉO 3 NGÓN)
+// VÒNG LẶP NỘI SUY 120Hz (8.33ms TICK)
 // ============================================================================
 static void tick(CFRunLoopTimerRef timerRef, void *info) {
     (void)timerRef; (void)info;
@@ -615,10 +603,10 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
 
     // 1. Khi người dùng đang KÉO 3 NGÓN:
     if (isDragging) {
-        // Xả mượt từ bể chứa kéo 3 ngón ở tần số 120Hz (hệ số 0.58 giúp bám sát tay tức thì mà không bị giật 60Hz):
+        // Tăng hệ số xả lên 0.75 để cửa sổ vọt theo tay nhanh và sát hơn:
         if (fabs(dragTargetDx) >= 0.05 || fabs(dragTargetDy) >= 0.05) {
-            dragEmitDx = dragTargetDx * 0.58;
-            dragEmitDy = dragTargetDy * 0.58;
+            dragEmitDx = dragTargetDx * 0.75;
+            dragEmitDy = dragTargetDy * 0.75;
             dragTargetDx -= dragEmitDx;
             dragTargetDy -= dragEmitDy;
 
@@ -628,9 +616,6 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
             emitDragNow = 1;
         }
 
-        // Giữ khóa phiên kéo (Drag Latch 380ms):
-        // Cho phép người dùng dừng tay ngắm vị trí cửa sổ HOẶC nhấc 3 ngón lên đặt lại để kéo nối tiếp
-        // mà KHÔNG BAO GIỜ bị rớt cửa sổ giữa chừng!
         if (dragContactGap >= 380.0) {
             stopNow = 1;
             stopWhy = "Kết thúc phiên kéo 3 ngón";
@@ -699,7 +684,6 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
     }
     pthread_mutex_unlock(&mu);
 
-    // Phát sự kiện kéo 3 ngón ở tần số 120Hz BÊN NGOÀI khóa Mutex để không bao giờ làm nghẽn cảm ứng USB!
     if (emitDragNow) {
         postDragMouseEvent(kCGEventLeftMouseDragged, dragEmitPos, dragEmitDx, dragEmitDy);
     }
@@ -913,7 +897,7 @@ static void checkAndAttachTrackpad(void) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v14 (120Hz Continuous Drag)" action:nil keyEquivalent:@""];
+    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v15 (Fast 3-Finger Drag)" action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
 
