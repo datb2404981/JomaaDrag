@@ -61,6 +61,10 @@ static _Atomic double lastMultiTouchT = 0.0;
 static _Atomic double lastAnyJomaaTouchT = 0.0;
 static _Atomic int naturalScrollingSetting = 1;
 
+// Nguồn phát sự kiện HID thống nhất giúp WindowServer khóa dính cửa sổ 100%
+static CGEventSourceRef hidEventSource = NULL;
+static int64_t dragEventNumber = 100;
+
 static int readNaturalScrolling(void) {
     CFPreferencesAppSynchronize(CFSTR(".GlobalPreferences"));
     CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("com.apple.swipescrolldirection"), CFSTR(".GlobalPreferences"));
@@ -78,14 +82,13 @@ static _Atomic int dragging = 0;
 static volatile sig_atomic_t stopRequested = 0;
 
 static double lastTouchT = 0.0;
-static double lastThreeFingerT = 0.0; // Tách riêng thời điểm có 3 ngón để 1 ngón không làm kẹt phiên kéo!
+static double lastThreeFingerT = 0.0;
 static double armSince = 0.0;
 static int latestPresent = 0;
 static double tRef = 0.0;
 
 // Vị trí con trỏ & bộ tích lũy kéo 1:1
 static double curX = 0.0, curY = 0.0;
-static double dragAnchorCursorX = 0.0, dragAnchorCursorY = 0.0;
 static double dragRemX = 0.0, dragRemY = 0.0;
 static double smoothDx = 0.0, smoothDy = 0.0;
 
@@ -118,6 +121,16 @@ static inline double nowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
 }
 
+static CGEventSourceRef sharedHIDSource(void) {
+    if (!hidEventSource) {
+        hidEventSource = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+        if (hidEventSource) {
+            CGEventSourceSetLocalEventsSuppressionInterval(hidEventSource, 0.0);
+        }
+    }
+    return hidEventSource;
+}
+
 static CGPoint cursorNow(void) {
     CGPoint p = CGPointZero;
     CGEventRef e = CGEventCreate(NULL);
@@ -137,7 +150,7 @@ static void emitMosScrollEvent(double stepY, uint32_t phase, uint32_t momentumPh
         intPixel = (directedStep > 0) ? 1 : -1;
     }
 
-    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 1, intPixel, 0, 0);
+    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent2(sharedHIDSource(), kCGScrollEventUnitPixel, 1, intPixel, 0, 0);
     if (!scrollEvent) return;
 
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventIsContinuous, 1);
@@ -170,15 +183,31 @@ static void stopMosScrollImmediately(int cancelTouchPhase) {
     mosPeakVelPerTick = 0.0;
 }
 
-static void postDragMouseEvent(CGEventType type, CGPoint p, int64_t dx, int64_t dy) {
-    CGEventRef e = CGEventCreateMouseEvent(NULL, type, p, kCGMouseButtonLeft);
+// Phát sự kiện Kéo 3 ngón chuẩn giao thức WindowServer (Khóa dính con trỏ & cửa sổ 1:1):
+static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy) {
+    CGEventSourceRef src = sharedHIDSource();
+    if (type == kCGEventLeftMouseDown) {
+        dragEventNumber++;
+    }
+
+    // 1. Khóa cứng con trỏ hệ thống vào đúng tọa độ p VÀ xóa ngay lập tức thời gian trễ 250ms của macOS:
+    CGWarpMouseCursorPosition(p);
+    CGAssociateMouseAndMouseCursorPosition(true);
+
+    // 2. Tạo sự kiện chuột từ cùng một nguồn HID (sharedHIDSource) và cùng số hiệu phiên kéo (dragEventNumber):
+    CGEventRef e = CGEventCreateMouseEvent(src, type, p, kCGMouseButtonLeft);
     if (!e) return;
+
     CGEventSetIntegerValueField(e, kCGEventSourceUserData, MAGIC);
+    CGEventSetIntegerValueField(e, kCGMouseEventNumber, dragEventNumber);
     CGEventSetIntegerValueField(e, kCGMouseEventClickState, 1);
-    CGEventSetIntegerValueField(e, kCGMouseEventDeltaX, dx);
-    CGEventSetIntegerValueField(e, kCGMouseEventDeltaY, dy);
-    CGEventSetFlags(e, CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState));
-    CGEventPost(kCGHIDEventTap, e);
+    CGEventSetIntegerValueField(e, kCGMouseEventDeltaX, (int64_t)llround(dx));
+    CGEventSetIntegerValueField(e, kCGMouseEventDeltaY, (int64_t)llround(dy));
+    CGEventSetDoubleValueField(e, kCGMouseEventDeltaX, dx);
+    CGEventSetDoubleValueField(e, kCGMouseEventDeltaY, dy);
+
+    // 3. Bơm vào kCGSessionEventTap để WindowServer nhận diện phiên kéo cửa sổ đồng bộ 100%
+    CGEventPost(kCGSessionEventTap, e);
     CFRelease(e);
 }
 
@@ -219,7 +248,7 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     }
     if (!event) return event;
 
-    // 1. Cho qua ngay lập tức các sự kiện mượt do JomaaDrag phát ra
+    // 1. Cho qua ngay lập tức các sự kiện do JomaaDrag phát ra
     int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
     if (userData == MAGIC) return event;
 
@@ -236,8 +265,8 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
         }
     }
 
-    // 3. Khóa chuột đứng yên CHỈ KHI đang thực sự cuộn 2 ngón hoặc đang kéo 3 ngón:
-    // Ngay khi về 1 ngón, isMultiTouch và isDragging đều = 0 -> chuột 1 ngón di chuyển tự do 100%!
+    // 3. Khi đang cuộn 2 ngón HOẶC đang đặt/kéo 3 ngón:
+    // Chặn tuyệt đối tín hiệu chuột phần cứng của Jomaa để nó không đẩy con trỏ bay khỏi thanh tiêu đề cửa sổ!
     if (isMultiTouch || isDragging) {
         if (type == kCGEventMouseMoved ||
             type == kCGEventLeftMouseDragged ||
@@ -286,7 +315,6 @@ static int computeMatchedFingerDelta(const TouchPos *curr, int currN,
     return matched;
 }
 
-// Hàm nội bộ nhả trạng thái kéo 3 ngón ngay lập tức và trả quyền cho chuột 1 ngón
 static void releaseDragAndUnlockCursorLocked(void) {
     dragArmed = 0;
     armSince = 0.0;
@@ -294,7 +322,6 @@ static void releaseDragAndUnlockCursorLocked(void) {
     smoothDx = smoothDy = 0.0;
     atomic_store_explicit(&dragging, 0, memory_order_relaxed);
     atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
-    // Đảm bảo macOS kết nối lại 100% phần cứng chuột với con trỏ ngay tức khắc
     CGAssociateMouseAndMouseCursorPosition(true);
 }
 
@@ -331,19 +358,16 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
 
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
 
-    // QUAN TRỌNG NHẤT: Nếu đang trong phiên kéo 3 ngón mà người dùng buông ra và chỉ còn 1 ngón (currCount <= 1)
-    // sau 25ms kể từ lúc rời 3 ngón -> KẾT THÚC KÉO NGAY LẬP TỨC ĐỂ 1 NGÓN DI CHUỘT TỰ DO!
+    // Nếu đang kéo 3 ngón mà buông ra chỉ còn <= 1 ngón: nhả phiên kéo ngay để 1 ngón di chuột tự do!
     if (isDragging && currCount <= 1 && (tn - lastThreeFingerT) >= 25.0) {
         CGPoint upPos = CGPointMake(curX, curY);
         releaseDragAndUnlockCursorLocked();
         isDragging = 0;
         pthread_mutex_unlock(&mu);
-        postDragMouseEvent(kCGEventLeftMouseUp, upPos, 0, 0);
+        postDragMouseEvent(kCGEventLeftMouseUp, upPos, 0.0, 0.0);
         pthread_mutex_lock(&mu);
     }
 
-    // Chỉ bật khóa chuột multiTouchActive khi thực sự có >= 2 ngón tay!
-    // Nếu chỉ có 1 ngón tay (currCount == 1) và không cuộn -> TẮT NGAY multiTouchActive để 1 ngón di chuột mượt!
     if (currCount >= 2 || isDragging) {
         atomic_store_explicit(&multiTouchActive, 1, memory_order_relaxed);
         atomic_store_explicit(&lastMultiTouchT, tn, memory_order_relaxed);
@@ -363,9 +387,6 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             double curCentroidY = sumY / (double)currCount;
 
             if (!dragArmed) {
-                CGPoint pNow = cursorNow();
-                dragAnchorCursorX = pNow.x;
-                dragAnchorCursorY = pNow.y;
                 dragCentroidStartX = curCentroidX;
                 dragCentroidStartY = curCentroidY;
                 dragArmed = 1;
@@ -375,11 +396,13 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                 double dY = -(curCentroidY - dragCentroidStartY) * SPEED_FACTOR;
                 double dist = sqrt(dX * dX + dY * dY);
 
-                if (dist >= 1.5) {
+                if (dist >= 1.2) {
                     stopMosScrollImmediately(1);
 
-                    curX = dragAnchorCursorX;
-                    curY = dragAnchorCursorY;
+                    // Lấy CHÍNH XÁC vị trí con trỏ thực trên màn hình ngay tại tích tắc bấm chuột xuống:
+                    CGPoint pNow = cursorNow();
+                    curX = pNow.x;
+                    curY = pNow.y;
                     dragRemX = 0.0;
                     dragRemY = 0.0;
                     smoothDx = 0.0;
@@ -389,8 +412,12 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     atomic_store_explicit(&dragging, 1, memory_order_relaxed);
                     isDragging = 1;
 
-                    CGPoint startP = CGPointMake(curX, curY);
-                    postDragMouseEvent(kCGEventLeftMouseDown, startP, 0, 0);
+                    // Phát LeftMouseDown kèm 1 gói LeftMouseDragged mồi tại chỗ (0,0) để WindowServer ngoạm chặt thanh tiêu đề!
+                    pthread_mutex_unlock(&mu);
+                    postDragMouseEvent(kCGEventLeftMouseDown, pNow, 0.0, 0.0);
+                    usleep(1500); // Đợi 1.5ms để ứng dụng kịp nhận diện Click vào thanh tiêu đề trước khi di chuyển
+                    postDragMouseEvent(kCGEventLeftMouseDragged, pNow, 0.0, 0.0);
+                    pthread_mutex_lock(&mu);
                 }
             }
         } else {
@@ -465,7 +492,6 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             }
             lastScrollFrameT = tn;
         } else if (!isDragging && currCount < 2) {
-            // Khi chỉ có 1 ngón tay sau > 60ms: nhả hoàn toàn trạng thái cuộn để 1 ngón di chuột ngay!
             if (mosTouchContactActive && timeSinceTwoFingers >= 60.0) {
                 mosTouchContactActive = 0;
                 atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
@@ -475,7 +501,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             }
         }
     } else {
-        // --- 3. ĐANG TRONG PHIÊN KÉO 3 NGÓN ---
+        // --- 3. ĐANG TRONG PHIÊN KÉO 3 NGÓN (DÍNH CỨNG CỬA SỔ & CON TRỎ 1:1) ---
         if (currCount >= 2) {
             double matchedDx = 0.0, matchedDy = 0.0;
             int matched = computeMatchedFingerDelta(currTouches, currCount, prevTouches, prevCount, &matchedDx, &matchedDy);
@@ -510,9 +536,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     curY += (double)stepY;
 
                     CGPoint targetP = CGPointMake(curX, curY);
-                    // KHÔNG gọi CGWarpMouseCursorPosition riêng lẻ vì nó làm đơ chuột 1 ngón 250ms sau khi buông!
-                    // Sự kiện postDragMouseEvent vào kCGHIDEventTap đã tự động di chuyển cả con trỏ lẫn cửa sổ 1:1!
-                    postDragMouseEvent(kCGEventLeftMouseDragged, targetP, stepX, stepY);
+                    postDragMouseEvent(kCGEventLeftMouseDragged, targetP, (double)stepX, (double)stepY);
                 }
             }
         } else {
@@ -545,7 +569,7 @@ static void stopDrag(const char *why) {
     releaseDragAndUnlockCursorLocked();
     pthread_mutex_unlock(&mu);
 
-    postDragMouseEvent(kCGEventLeftMouseUp, p, 0, 0);
+    postDragMouseEvent(kCGEventLeftMouseUp, p, 0.0, 0.0);
 }
 
 // ============================================================================
@@ -630,8 +654,7 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
     }
 
-    // 3. Quản lý kết thúc phiên kéo 3 ngón dựa trên threeFingerGap:
-    // Dù người dùng có đặt 1 ngón vào ngay lập tức, threeFingerGap vẫn tăng và tự động nhả kéo sau 45ms!
+    // 3. Quản lý kết thúc phiên kéo 3 ngón:
     if (isDragging) {
         double dragHoldTimeout = (dragEstimatedSpeed < 0.8) ? 260.0 : 50.0;
         if (touchGap >= dragHoldTimeout || threeFingerGap >= 50.0) {
@@ -850,7 +873,7 @@ static void checkAndAttachTrackpad(void) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v12 (Instant 1-Finger Handover)" action:nil keyEquivalent:@""];
+    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v13 (Window Lock 1:1)" action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
 
@@ -1138,6 +1161,7 @@ static void checkAndAttachTrackpad(void) {
     if (timer) CFRelease(timer);
     if (eventTapSource) CFRelease(eventTapSource);
     if (eventTap) CFRelease(eventTap);
+    if (hidEventSource) CFRelease(hidEventSource);
     detachAndResetTrackpad();
     [NSApp terminate:nil];
 }
