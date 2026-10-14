@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+*.o
+*.dSYM/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Log files
+*.log
+*.err
+/tmp/jomaadrag.*
+
+# Xcode & IDE
+.vscode/
+.idea/
+*.xcworkspace
+*.xcuserdatad
