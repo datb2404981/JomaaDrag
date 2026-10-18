@@ -24,6 +24,9 @@ It bridges the gap between third-party USB multi-touch hardware and macOS, provi
 - **🚀 Mos-Style `Option (⌥)` Dash / Turbo Scroll**:
   Hold the `Option (⌥)` key while scrolling (up/down or left/right) to boost scroll speed by **3.2×** with extended momentum glide—automatically stripping the `Alternate` flag from synthesized scroll events so browsers, Figma, and VS Code don't accidentally trigger zoom shortcuts.
 
+- **🌐 Native 2-Finger Swipe Back / Forward in Browsers**:
+  Swipe 2 fingers left or right to navigate **Back / Forward** in Google Chrome, Safari, Arc, and Finder—synthesizing companion `NSEventTypeGesture` (`kIOHIDEventTypeScroll`) and `isDirectionInvertedFromDevice` events just like a built-in MacBook Trackpad.
+
 - **🎯 Per-Finger ID Tracking (Zero-Stutter)**:
   Tracks individual finger deltas using hardware touch `identifier`s instead of naive centroid averaging. Prevents phantom jumps and coordinate spikes when fingers touch down or lift asynchronously.
 

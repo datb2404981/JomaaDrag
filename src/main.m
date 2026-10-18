@@ -47,6 +47,7 @@ static int (*MTDeviceIsRunning)(MTDeviceRef);
 
 #define BUILTIN_ID 144115188075855923ULL
 #define MAGIC 0x4A4D44LL // 'JMD'
+#define MOS_PASS_MAGIC 0x4D4F53534D4F4F54LL // Passthrough cho Mos.app để không nuốt sự kiện vuốt Trackpad
 
 // ĐÃ NÂNG TỐC ĐỘ KÉO 3 NGÓN TỪ 1400 LÊN 2350 (Nhanh, nhẹ và thoát tay hơn hẳn)
 static const double SPEED_FACTOR = 2350.0;
@@ -163,18 +164,20 @@ static inline int isOptionDashActive(void) {
 
 static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint32_t momentumPhase) {
     int natural = atomic_load_explicit(&naturalScrollingSetting, memory_order_relaxed);
-    double directedX = natural ? -stepX : stepX;
+    // Trục X của MultitouchSupport tăng từ trái (0.0) sang phải (1.0), cùng chiều dương với scrollingDeltaX khi bật Natural Scrolling
+    double directedX = natural ? stepX : -stepX;
+    // Trục Y của MultitouchSupport tăng từ dưới (0.0) lên trên (1.0), ngược chiều dương với scrollingDeltaY khi bật Natural Scrolling
     double directedY = natural ? -stepY : stepY;
 
     int32_t ptX = 0;
     int32_t ptY = 0;
-    int64_t fixedX = 0;
-    int64_t fixedY = 0;
 
     if ((phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled || momentumPhase == kCGMomentumScrollPhaseEnd) &&
         fabs(directedX) < 1e-4 && fabs(directedY) < 1e-4) {
         subpixelRemX = 0.0;
         subpixelRemY = 0.0;
+        directedX = 0.0;
+        directedY = 0.0;
     } else {
         double totalX = directedX + subpixelRemX;
         double totalY = directedY + subpixelRemY;
@@ -182,8 +185,6 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
         ptY = (int32_t)llround(totalY);
         subpixelRemX = totalX - (double)ptX;
         subpixelRemY = totalY - (double)ptY;
-        fixedX = (int64_t)llround(directedX * 65536.0);
-        fixedY = (int64_t)llround(directedY * 65536.0);
     }
 
     // 2 trục (wheelCount = 2): Axis 1 = Dọc (Y), Axis 2 = Ngang (X)
@@ -199,6 +200,9 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
     }
 
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventIsContinuous, 1);
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventScrollCount, 1);
+    // Trường 137 (0x89) = -[NSEvent isDirectionInvertedFromDevice], bắt buộc cho vuốt Back/Forward trên Chrome & Safari
+    CGEventSetIntegerValueField(scrollEvent, 137, natural ? 1 : 0);
 
     if (phase != 0) {
         CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventScrollPhase, phase);
@@ -207,17 +211,37 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
         CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventMomentumPhase, momentumPhase);
     }
 
-    // Đặt cả PointDelta (nguyên) và FixedPtDelta (16.16 fixed-point) cho cả 2 trục dọc & ngang
+    // Lưu ý: KHÔNG gọi CGEventSetIntegerValueField(..., kCGScrollWheelEventDeltaAxis1/2, ...) sau PointDeltaAxis1/2
+    // vì CoreGraphics sẽ ghi đè PointDeltaAxis về ±8 và FixedPtDeltaAxis về ±1.0!
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis1, ptY);
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis2, ptX);
-    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis1, ptY > 0 ? 1 : (ptY < 0 ? -1 : 0));
-    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis2, ptX > 0 ? 1 : (ptX < 0 ? -1 : 0));
-    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, fixedY);
-    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, fixedX);
-    CGEventSetIntegerValueField(scrollEvent, kCGEventSourceUserData, MAGIC);
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, directedY);
+    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, directedX);
+    CGEventSetIntegerValueField(scrollEvent, kCGEventSourceUserData, MOS_PASS_MAGIC);
 
     CGEventPost(kCGSessionEventTap, scrollEvent);
     CFRelease(scrollEvent);
+
+    // Phát kèm sự kiện NSEventTypeGesture (type = 29, field 110 = 6 = kIOHIDEventTypeScroll)
+    // để -[NSEvent trackSwipeEventWithOptions:...] trong Safari & Chrome tích lũy gestureAmount cho cử chỉ vuốt Back/Forward
+    if (phase == kCGScrollPhaseChanged || phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled) {
+        CGEventRef gestureEvent = CGEventCreate(sharedHIDSource());
+        if (gestureEvent) {
+            CGEventSetType(gestureEvent, (CGEventType)29);
+            if ((flags & kCGEventFlagMaskAlternate) &&
+                !(flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl))) {
+                CGEventSetFlags(gestureEvent, flags & ~kCGEventFlagMaskAlternate);
+            }
+            CGEventSetIntegerValueField(gestureEvent, 110, 6); // kCGEventGestureHIDType = 6 (Scroll Gesture)
+            CGEventSetIntegerValueField(gestureEvent, 132, phase); // Gesture Phase (2=Changed, 4=Ended, 8=Cancelled)
+            CGEventSetDoubleValueField(gestureEvent, 118, directedX * 1.85); // Horizontal Swipe Delta
+            CGEventSetDoubleValueField(gestureEvent, 119, directedY);        // Vertical Swipe Delta
+            CGEventSetIntegerValueField(gestureEvent, 137, natural ? 1 : 0); // isDirectionInvertedFromDevice
+            CGEventSetIntegerValueField(gestureEvent, kCGEventSourceUserData, MOS_PASS_MAGIC);
+            CGEventPost(kCGSessionEventTap, gestureEvent);
+            CFRelease(gestureEvent);
+        }
+    }
 }
 
 static void stopMosScrollImmediately(int cancelTouchPhase) {
@@ -302,7 +326,7 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     if (!event) return event;
 
     int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
-    if (userData == MAGIC) return event;
+    if (userData == MAGIC || userData == MOS_PASS_MAGIC) return event;
 
     double now = nowMs();
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
@@ -542,18 +566,22 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     double dashBoost = dashActive ? 3.2 : 1.0;
                     double maxBuf = dashActive ? 1800.0 : 600.0;
 
-                    // Ổn định hướng vuốt ngang/dọc để không bị lệch trục khi lướt cổ tay
+                    // Ổn định hướng vuốt ngang/dọc: khóa cứng trục phụ để kích hoạt vuốt Back/Forward trình duyệt chuẩn xác
                     double ax = fabs(matchedDx) * 1.25;
                     double ay = fabs(matchedDy);
                     scrollIntentX = scrollIntentX * 0.72 + ax * 0.28;
                     scrollIntentY = scrollIntentY * 0.72 + ay * 0.28;
 
-                    if (scrollIntentX > scrollIntentY * 1.65 || ax > ay * 2.0) {
-                        matchedDy *= 0.08;
-                        if (ay < 0.0012) matchedDy = 0.0;
-                    } else if (scrollIntentY > scrollIntentX * 1.65 || ay > ax * 2.0) {
-                        matchedDx *= 0.08;
-                        if (ax < 0.0012) matchedDx = 0.0;
+                    if (scrollIntentX > scrollIntentY * 1.35 || ax > ay * 1.60) {
+                        matchedDy = 0.0;
+                        mosTargetBufferY = 0.0;
+                        mosVelocityPerTickY = 0.0;
+                        subpixelRemY = 0.0;
+                    } else if (scrollIntentY > scrollIntentX * 1.50 || ay > ax * 1.80) {
+                        matchedDx = 0.0;
+                        mosTargetBufferX = 0.0;
+                        mosVelocityPerTickX = 0.0;
+                        subpixelRemX = 0.0;
                     }
 
                     // Gia tốc theo tốc độ vuốt cho cả trục X (ngang) và Y (dọc) + hệ số Option Dash
@@ -734,6 +762,11 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
             if (fabs(mosPeakVelPerTickX) > fabs(launchVelX)) launchVelX = mosPeakVelPerTickX;
             if (fabs(mosPeakVelPerTickY) > fabs(launchVelY)) launchVelY = mosPeakVelPerTickY;
         }
+        if (fabs(launchVelX) > fabs(launchVelY) * 1.35) {
+            launchVelY = 0.0;
+        } else if (fabs(launchVelY) > fabs(launchVelX) * 1.50) {
+            launchVelX = 0.0;
+        }
 
         if (mosPhaseState == 1) {
             emitMosScrollEvent(0.0, 0.0, kCGScrollPhaseEnded, 0);
@@ -776,6 +809,16 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
             double stepY = mosTargetBufferY * 0.35;
             mosTargetBufferX -= stepX;
             mosTargetBufferY -= stepY;
+
+            if (fabs(stepX) > fabs(stepY) * 1.35) {
+                stepY = 0.0;
+                mosTargetBufferY = 0.0;
+                subpixelRemY = 0.0;
+            } else if (fabs(stepY) > fabs(stepX) * 1.50) {
+                stepX = 0.0;
+                mosTargetBufferX = 0.0;
+                subpixelRemX = 0.0;
+            }
 
             uint32_t phase = (mosPhaseState == 0) ? kCGScrollPhaseBegan : kCGScrollPhaseChanged;
             mosPhaseState = 1;
