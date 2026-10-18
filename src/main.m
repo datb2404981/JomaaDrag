@@ -110,17 +110,25 @@ static TouchPos prevTouches[MAX_TOUCHES];
 static int prevCount = 0;
 
 // ============================================================================
-// PER-FINGER ID TRACKING & MOS 120Hz SCROLL INTERPOLATOR
+// PER-FINGER ID TRACKING & MOS 120Hz 2D SCROLL INTERPOLATOR + OPTION (⌥) DASH
 // ============================================================================
 static double lastScrollFrameT = 0.0;
 static double lastTwoFingerT = 0.0;
 
+static double mosTargetBufferX = 0.0;
 static double mosTargetBufferY = 0.0;
-static double mosVelocityPerTick = 0.0;
-static double mosPeakVelPerTick = 0.0;
+static double mosVelocityPerTickX = 0.0;
+static double mosVelocityPerTickY = 0.0;
+static double mosPeakVelPerTickX = 0.0;
+static double mosPeakVelPerTickY = 0.0;
 static double mosPeakVelTime = 0.0;
+static double subpixelRemX = 0.0;
+static double subpixelRemY = 0.0;
+static double scrollIntentX = 0.0;
+static double scrollIntentY = 0.0;
 static int mosTouchContactActive = 0;
 static int mosPhaseState = 0;
+static int mosDashMomentum = 0; // Cờ tăng tốc quán tính khi giữ phím Option (⌥) kiểu Mos
 
 static inline double nowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
@@ -146,29 +154,66 @@ static CGPoint cursorNow(void) {
     return p;
 }
 
-static void emitMosScrollEvent(double stepY, uint32_t phase, uint32_t momentumPhase) {
-    int natural = atomic_load_explicit(&naturalScrollingSetting, memory_order_relaxed);
-    double directedStep = natural ? -stepY : stepY;
+// Kiểm tra phím Option (⌥) đang được giữ để kích hoạt Dash (Cuộn siêu tốc kiểu Mos)
+static inline int isOptionDashActive(void) {
+    CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+    return ((flags & kCGEventFlagMaskAlternate) != 0 &&
+            (flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) == 0) ? 1 : 0;
+}
 
-    int32_t intPixel = (int32_t)round(directedStep);
-    if (intPixel == 0 && fabs(directedStep) >= 0.35) {
-        intPixel = (directedStep > 0) ? 1 : -1;
+static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint32_t momentumPhase) {
+    int natural = atomic_load_explicit(&naturalScrollingSetting, memory_order_relaxed);
+    double directedX = natural ? -stepX : stepX;
+    double directedY = natural ? -stepY : stepY;
+
+    int32_t ptX = 0;
+    int32_t ptY = 0;
+    int64_t fixedX = 0;
+    int64_t fixedY = 0;
+
+    if ((phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled || momentumPhase == kCGMomentumScrollPhaseEnd) &&
+        fabs(directedX) < 1e-4 && fabs(directedY) < 1e-4) {
+        subpixelRemX = 0.0;
+        subpixelRemY = 0.0;
+    } else {
+        double totalX = directedX + subpixelRemX;
+        double totalY = directedY + subpixelRemY;
+        ptX = (int32_t)llround(totalX);
+        ptY = (int32_t)llround(totalY);
+        subpixelRemX = totalX - (double)ptX;
+        subpixelRemY = totalY - (double)ptY;
+        fixedX = (int64_t)llround(directedX * 65536.0);
+        fixedY = (int64_t)llround(directedY * 65536.0);
     }
 
-    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent2(sharedHIDSource(), kCGScrollEventUnitPixel, 1, intPixel, 0, 0);
+    // 2 trục (wheelCount = 2): Axis 1 = Dọc (Y), Axis 2 = Ngang (X)
+    CGEventRef scrollEvent = CGEventCreateScrollWheelEvent2(
+        sharedHIDSource(), kCGScrollEventUnitPixel, 2, ptY, ptX, 0);
     if (!scrollEvent) return;
 
+    // Gỡ cờ Option (⌥) khỏi sự kiện cuộn để trình duyệt / VS Code / Figma không hiểu nhầm là phím tắt Zoom
+    CGEventFlags flags = CGEventGetFlags(scrollEvent);
+    if ((flags & kCGEventFlagMaskAlternate) &&
+        !(flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl))) {
+        CGEventSetFlags(scrollEvent, flags & ~kCGEventFlagMaskAlternate);
+    }
+
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventIsContinuous, 1);
-    
+
     if (phase != 0) {
         CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventScrollPhase, phase);
     }
     if (momentumPhase != 0) {
         CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventMomentumPhase, momentumPhase);
     }
-    
-    CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis1, directedStep);
-    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, (int64_t)llround(directedStep * 65536.0));
+
+    // Đặt cả PointDelta (nguyên) và FixedPtDelta (16.16 fixed-point) cho cả 2 trục dọc & ngang
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis1, ptY);
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis2, ptX);
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis1, ptY > 0 ? 1 : (ptY < 0 ? -1 : 0));
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis2, ptX > 0 ? 1 : (ptX < 0 ? -1 : 0));
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, fixedY);
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis2, fixedX);
     CGEventSetIntegerValueField(scrollEvent, kCGEventSourceUserData, MAGIC);
 
     CGEventPost(kCGSessionEventTap, scrollEvent);
@@ -177,15 +222,23 @@ static void emitMosScrollEvent(double stepY, uint32_t phase, uint32_t momentumPh
 
 static void stopMosScrollImmediately(int cancelTouchPhase) {
     if (mosPhaseState == 1) {
-        emitMosScrollEvent(0.0, cancelTouchPhase ? kCGScrollPhaseCancelled : kCGScrollPhaseEnded, 0);
+        emitMosScrollEvent(0.0, 0.0, cancelTouchPhase ? kCGScrollPhaseCancelled : kCGScrollPhaseEnded, 0);
     } else if (mosPhaseState == 2) {
-        emitMosScrollEvent(0.0, 0, kCGMomentumScrollPhaseEnd);
+        emitMosScrollEvent(0.0, 0.0, 0, kCGMomentumScrollPhaseEnd);
     }
     mosPhaseState = 0;
     mosTouchContactActive = 0;
+    mosDashMomentum = 0;
+    mosTargetBufferX = 0.0;
     mosTargetBufferY = 0.0;
-    mosVelocityPerTick = 0.0;
-    mosPeakVelPerTick = 0.0;
+    mosVelocityPerTickX = 0.0;
+    mosVelocityPerTickY = 0.0;
+    mosPeakVelPerTickX = 0.0;
+    mosPeakVelPerTickY = 0.0;
+    subpixelRemX = 0.0;
+    subpixelRemY = 0.0;
+    scrollIntentX = 0.0;
+    scrollIntentY = 0.0;
 }
 
 static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy) {
@@ -437,7 +490,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             armSince = 0.0;
         }
 
-        // --- 2. THUẬT TOÁN CUỘN MƯỢT 2 NGÓN (GIỮ NGUYÊN ĐỘ ĐẦM VỪA PHẢI) ---
+        // --- 2. THUẬT TOÁN CUỘN MƯỢT 2 NGÓN 2 CHIỀU (NGANG & DỌC + OPTION DASH KIỂU MOS) ---
         double timeSinceTwoFingers = tn - lastTwoFingerT;
         int isTwoFingerScroll = 0;
 
@@ -453,51 +506,99 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
         if (isTwoFingerScroll) {
             if (!mosTouchContactActive) {
                 if (mosPhaseState == 2) {
-                    emitMosScrollEvent(0.0, 0, kCGMomentumScrollPhaseEnd);
+                    emitMosScrollEvent(0.0, 0.0, 0, kCGMomentumScrollPhaseEnd);
                 }
                 mosPhaseState = 0;
+                mosTargetBufferX = 0.0;
                 mosTargetBufferY = 0.0;
-                mosVelocityPerTick = 0.0;
-                mosPeakVelPerTick = 0.0;
+                mosVelocityPerTickX = 0.0;
+                mosVelocityPerTickY = 0.0;
+                mosPeakVelPerTickX = 0.0;
+                mosPeakVelPerTickY = 0.0;
+                subpixelRemX = 0.0;
+                subpixelRemY = 0.0;
+                scrollIntentX = 0.0;
+                scrollIntentY = 0.0;
+                mosDashMomentum = isOptionDashActive();
                 mosTouchContactActive = 1;
             }
 
             double matchedDx = 0.0, matchedDy = 0.0;
-            int matchedCount = computeMatchedFingerDelta(currTouches, currCount, prevTouches, prevCount, &matchedDx, &matchedDy);
+            int checkFingers = (currCount == 1) ? 1 : 2;
+            int matchedCount = computeMatchedFingerDelta(currTouches, checkFingers, prevTouches, prevCount, &matchedDx, &matchedDy);
 
             if (matchedCount > 0) {
                 double dt = tn - lastScrollFrameT;
                 if (dt < 4.0) dt = 4.0;
                 if (dt > 45.0) dt = 12.0;
 
-                if (fabs(matchedDy) > 0.00004) {
+                if (hypot(matchedDx, matchedDy) > 0.00003) {
                     double sens = atomic_load_explicit(&sensitivityMultiplier, memory_order_relaxed);
                     if (sens < 0.2) sens = 0.2;
                     if (sens > 4.0) sens = 4.0;
 
-                    double rawVel = fabs(matchedDy) / dt;
-                    double flickGain = 1.0 + fmin(rawVel * 480.0, 1.40);
+                    int dashActive = isOptionDashActive();
+                    if (dashActive) mosDashMomentum = 1;
+                    double dashBoost = dashActive ? 3.2 : 1.0;
+                    double maxBuf = dashActive ? 1800.0 : 600.0;
 
-                    double BASE_SCALE = 780.0 * sens;
-                    double deltaPixels = matchedDy * BASE_SCALE * flickGain;
+                    // Ổn định hướng vuốt ngang/dọc để không bị lệch trục khi lướt cổ tay
+                    double ax = fabs(matchedDx) * 1.25;
+                    double ay = fabs(matchedDy);
+                    scrollIntentX = scrollIntentX * 0.72 + ax * 0.28;
+                    scrollIntentY = scrollIntentY * 0.72 + ay * 0.28;
 
-                    if ((deltaPixels > 2.5 && mosTargetBufferY < -2.0) ||
-                        (deltaPixels < -2.5 && mosTargetBufferY > 2.0)) {
-                        mosTargetBufferY = deltaPixels;
-                        mosVelocityPerTick = 0.0;
-                        mosPeakVelPerTick = 0.0;
-                    } else {
-                        mosTargetBufferY += deltaPixels;
+                    if (scrollIntentX > scrollIntentY * 1.65 || ax > ay * 2.0) {
+                        matchedDy *= 0.08;
+                        if (ay < 0.0012) matchedDy = 0.0;
+                    } else if (scrollIntentY > scrollIntentX * 1.65 || ay > ax * 2.0) {
+                        matchedDx *= 0.08;
+                        if (ax < 0.0012) matchedDx = 0.0;
                     }
 
-                    if (mosTargetBufferY > 600.0) mosTargetBufferY = 600.0;
-                    if (mosTargetBufferY < -600.0) mosTargetBufferY = -600.0;
+                    // Gia tốc theo tốc độ vuốt cho cả trục X (ngang) và Y (dọc) + hệ số Option Dash
+                    double rawVelX = fabs(matchedDx) / dt;
+                    double flickGainX = 1.0 + fmin(rawVelX * 480.0, 1.40);
+                    double deltaPixelsX = matchedDx * (880.0 * sens) * flickGainX * dashBoost;
 
-                    double instVelPerTick = deltaPixels * (8.33 / dt);
-                    mosVelocityPerTick = 0.65 * instVelPerTick + 0.35 * mosVelocityPerTick;
+                    double rawVelY = fabs(matchedDy) / dt;
+                    double flickGainY = 1.0 + fmin(rawVelY * 480.0, 1.40);
+                    double deltaPixelsY = matchedDy * (780.0 * sens) * flickGainY * dashBoost;
 
-                    if (fabs(instVelPerTick) >= fabs(mosPeakVelPerTick) * 0.85 || (tn - mosPeakVelTime) > 75.0) {
-                        mosPeakVelPerTick = instVelPerTick * 1.15;
+                    // Đảo chiều tức thì trên trục X
+                    if ((deltaPixelsX > 2.0 && mosTargetBufferX < -1.5) ||
+                        (deltaPixelsX < -2.0 && mosTargetBufferX > 1.5)) {
+                        mosTargetBufferX = deltaPixelsX;
+                        mosVelocityPerTickX = 0.0;
+                        mosPeakVelPerTickX = 0.0;
+                    } else {
+                        mosTargetBufferX += deltaPixelsX;
+                    }
+                    if (mosTargetBufferX > maxBuf) mosTargetBufferX = maxBuf;
+                    if (mosTargetBufferX < -maxBuf) mosTargetBufferX = -maxBuf;
+
+                    // Đảo chiều tức thì trên trục Y
+                    if ((deltaPixelsY > 2.5 && mosTargetBufferY < -2.0) ||
+                        (deltaPixelsY < -2.5 && mosTargetBufferY > 2.0)) {
+                        mosTargetBufferY = deltaPixelsY;
+                        mosVelocityPerTickY = 0.0;
+                        mosPeakVelPerTickY = 0.0;
+                    } else {
+                        mosTargetBufferY += deltaPixelsY;
+                    }
+                    if (mosTargetBufferY > maxBuf) mosTargetBufferY = maxBuf;
+                    if (mosTargetBufferY < -maxBuf) mosTargetBufferY = -maxBuf;
+
+                    double instVelPerTickX = deltaPixelsX * (8.33 / dt);
+                    double instVelPerTickY = deltaPixelsY * (8.33 / dt);
+                    mosVelocityPerTickX = 0.65 * instVelPerTickX + 0.35 * mosVelocityPerTickX;
+                    mosVelocityPerTickY = 0.65 * instVelPerTickY + 0.35 * mosVelocityPerTickY;
+
+                    double instSpeed = hypot(instVelPerTickX, instVelPerTickY);
+                    double peakSpeed = hypot(mosPeakVelPerTickX, mosPeakVelPerTickY);
+                    if (instSpeed >= peakSpeed * 0.85 || (tn - mosPeakVelTime) > 75.0) {
+                        mosPeakVelPerTickX = instVelPerTickX * 1.15;
+                        mosPeakVelPerTickY = instVelPerTickY * 1.15;
                         mosPeakVelTime = tn;
                     }
                 }
@@ -622,33 +723,44 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
     }
 
-    // 2. Khi người dùng nhấc 2 ngón tay khỏi bàn rê (Cuộn trang):
+    // 2. Khi người dùng nhấc 2 ngón tay khỏi bàn rê (Cuộn trang 2 chiều):
     if (!isDragging && mosTouchContactActive && twoFingerGap >= 38.0) {
         mosTouchContactActive = 0;
         atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
 
-        double launchVel = mosVelocityPerTick;
-        if ((tn - mosPeakVelTime) <= 80.0 && fabs(mosPeakVelPerTick) > fabs(launchVel)) {
-            launchVel = mosPeakVelPerTick;
+        double launchVelX = mosVelocityPerTickX;
+        double launchVelY = mosVelocityPerTickY;
+        if ((tn - mosPeakVelTime) <= 80.0) {
+            if (fabs(mosPeakVelPerTickX) > fabs(launchVelX)) launchVelX = mosPeakVelPerTickX;
+            if (fabs(mosPeakVelPerTickY) > fabs(launchVelY)) launchVelY = mosPeakVelPerTickY;
         }
 
         if (mosPhaseState == 1) {
-            emitMosScrollEvent(0.0, kCGScrollPhaseEnded, 0);
+            emitMosScrollEvent(0.0, 0.0, kCGScrollPhaseEnded, 0);
         }
 
-        if (fabs(launchVel) >= 1.2) {
-            mosVelocityPerTick = launchVel;
-            if (mosVelocityPerTick > 42.0) mosVelocityPerTick = 42.0;
-            if (mosVelocityPerTick < -42.0) mosVelocityPerTick = -42.0;
+        if (isOptionDashActive()) {
+            mosDashMomentum = 1;
+        }
+        double maxLaunchVel = mosDashMomentum ? 125.0 : 42.0;
+
+        if (hypot(launchVelX, launchVelY) >= 1.0) {
+            mosVelocityPerTickX = fmin(fmax(launchVelX, -maxLaunchVel), maxLaunchVel);
+            mosVelocityPerTickY = fmin(fmax(launchVelY, -maxLaunchVel), maxLaunchVel);
             mosPhaseState = 2;
+            mosTargetBufferX = 0.0;
             mosTargetBufferY = 0.0;
-            emitMosScrollEvent(mosVelocityPerTick, 0, kCGMomentumScrollPhaseBegin);
+            emitMosScrollEvent(mosVelocityPerTickX, mosVelocityPerTickY, 0, kCGMomentumScrollPhaseBegin);
         } else {
             mosPhaseState = 0;
+            mosDashMomentum = 0;
+            mosTargetBufferX = 0.0;
             mosTargetBufferY = 0.0;
-            mosVelocityPerTick = 0.0;
+            mosVelocityPerTickX = 0.0;
+            mosVelocityPerTickY = 0.0;
         }
-        mosPeakVelPerTick = 0.0;
+        mosPeakVelPerTickX = 0.0;
+        mosPeakVelPerTickY = 0.0;
     }
 
     if (touchGap >= 45.0 && !isDragging && !mosTouchContactActive) {
@@ -659,27 +771,35 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
 
     // 3A. Khi 2 ngón tay ĐANG CHẠM bàn rê:
     if (!isDragging && mosTouchContactActive) {
-        if (fabs(mosTargetBufferY) >= 0.08) {
+        if (fabs(mosTargetBufferX) >= 0.06 || fabs(mosTargetBufferY) >= 0.06) {
+            double stepX = mosTargetBufferX * 0.36;
             double stepY = mosTargetBufferY * 0.35;
+            mosTargetBufferX -= stepX;
             mosTargetBufferY -= stepY;
 
             uint32_t phase = (mosPhaseState == 0) ? kCGScrollPhaseBegan : kCGScrollPhaseChanged;
             mosPhaseState = 1;
-            emitMosScrollEvent(stepY, phase, 0);
+            emitMosScrollEvent(stepX, stepY, phase, 0);
         }
     }
-    // 3B. Khi ĐÃ NHẤC TAY (Pha trôi quán tính Momentum):
+    // 3B. Khi ĐÃ NHẤC TAY (Pha trôi quán tính Momentum 2 chiều + Option Dash):
     else if (!isDragging && !mosTouchContactActive && mosPhaseState == 2) {
-        double speedRatio = fmin(fabs(mosVelocityPerTick) / 18.0, 1.0);
-        double decay = 0.925 + (0.955 - 0.925) * speedRatio;
-        mosVelocityPerTick *= decay;
+        double speedMag = hypot(mosVelocityPerTickX, mosVelocityPerTickY);
+        double speedRatio = fmin(speedMag / (mosDashMomentum ? 36.0 : 18.0), 1.0);
+        double decay = mosDashMomentum
+            ? (0.945 + 0.025 * speedRatio)
+            : (0.925 + (0.955 - 0.925) * speedRatio);
+        mosVelocityPerTickX *= decay;
+        mosVelocityPerTickY *= decay;
 
-        if (fabs(mosVelocityPerTick) >= 0.18) {
-            emitMosScrollEvent(mosVelocityPerTick, 0, kCGMomentumScrollPhaseContinue);
+        if (hypot(mosVelocityPerTickX, mosVelocityPerTickY) >= 0.16) {
+            emitMosScrollEvent(mosVelocityPerTickX, mosVelocityPerTickY, 0, kCGMomentumScrollPhaseContinue);
         } else {
-            emitMosScrollEvent(0.0, 0, kCGMomentumScrollPhaseEnd);
+            emitMosScrollEvent(0.0, 0.0, 0, kCGMomentumScrollPhaseEnd);
             mosPhaseState = 0;
-            mosVelocityPerTick = 0.0;
+            mosDashMomentum = 0;
+            mosVelocityPerTickX = 0.0;
+            mosVelocityPerTickY = 0.0;
         }
     }
     pthread_mutex_unlock(&mu);

@@ -18,8 +18,11 @@ It bridges the gap between third-party USB multi-touch hardware and macOS, provi
 
 ## ✨ Features
 
-- **⚡ 120Hz Mos-Style Momentum Interpolation**:
-  Decouples raw USB input polling from display rendering. Smoothly discharges scroll velocity using a subpixel floating-point spring accumulator matching MacBook ProMotion displays.
+- **⚡ 120Hz 2D Mos-Style Momentum Interpolation (Horizontal & Vertical)**:
+  Decouples raw USB input polling from display rendering across both vertical (`Axis 1`) and horizontal (`Axis 2`) axes. Smoothly discharges scroll velocity using a subpixel floating-point spring accumulator and gesture-intent stabilization matching MacBook ProMotion displays.
+
+- **🚀 Mos-Style `Option (⌥)` Dash / Turbo Scroll**:
+  Hold the `Option (⌥)` key while scrolling (up/down or left/right) to boost scroll speed by **3.2×** with extended momentum glide—automatically stripping the `Alternate` flag from synthesized scroll events so browsers, Figma, and VS Code don't accidentally trigger zoom shortcuts.
 
 - **🎯 Per-Finger ID Tracking (Zero-Stutter)**:
   Tracks individual finger deltas using hardware touch `identifier`s instead of naive centroid averaging. Prevents phantom jumps and coordinate spikes when fingers touch down or lift asynchronously.
