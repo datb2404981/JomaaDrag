@@ -111,7 +111,7 @@ static TouchPos prevTouches[MAX_TOUCHES];
 static int prevCount = 0;
 
 // ============================================================================
-// PER-FINGER ID TRACKING & MOS 120Hz 2D SCROLL INTERPOLATOR + OPTION (⌥) DASH
+// PER-FINGER ID TRACKING & MOS 120Hz 2D SCROLL + 120Hz PINCH-TO-ZOOM ENGINE
 // ============================================================================
 static double lastScrollFrameT = 0.0;
 static double lastTwoFingerT = 0.0;
@@ -129,7 +129,16 @@ static double scrollIntentX = 0.0;
 static double scrollIntentY = 0.0;
 static int mosTouchContactActive = 0;
 static int mosPhaseState = 0;
+static int mosHorizontalSwipeActive = 0;
 static int mosDashMomentum = 0; // Cờ tăng tốc quán tính khi giữ phím Option (⌥) kiểu Mos
+
+// Trạng thái 120Hz Pinch-to-Zoom (NSEventTypeMagnify) & Bộ phân rã động học 2 ngón
+static int twoFingerMode = 0; // 0 = Chưa khóa, 1 = Cuộn 2 chiều (Scroll), 2 = Phóng to/Thu nhỏ (Pinch Zoom)
+static int zoomTouchContactActive = 0;
+static int zoomPhaseState = 0;
+static double zoomTargetBuffer = 0.0;
+static int pinchStreak = 0;
+static int scrollStreak = 0;
 
 static inline double nowMs(void) {
     return CFAbsoluteTimeGetCurrent() * 1000.0;
@@ -162,18 +171,45 @@ static inline int isOptionDashActive(void) {
             (flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl)) == 0) ? 1 : 0;
 }
 
-static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint32_t momentumPhase) {
+// Phát sự kiện Phóng to / Thu nhỏ (NSEventTypeMagnify = CGEventType 29, field 110 = 8) ở tần số 120Hz
+static void emitMagnifyEvent(double stepMag, uint32_t phase) {
+    CGEventRef gestureEvent = CGEventCreate(sharedHIDSource());
+    if (!gestureEvent) return;
+
+    CGEventSetType(gestureEvent, (CGEventType)29);
+    CGEventSetIntegerValueField(gestureEvent, 110, 8);     // kIOHIDEventTypeZoom -> NSEventTypeMagnify (30)
+    CGEventSetIntegerValueField(gestureEvent, 132, phase); // 1=Began, 2=Changed, 4=Ended, 8=Cancelled
+    CGEventSetDoubleValueField(gestureEvent, 118, stepMag); // -[NSEvent magnification]
+    CGEventSetIntegerValueField(gestureEvent, kCGEventSourceUserData, MOS_PASS_MAGIC);
+    CGEventPost(kCGSessionEventTap, gestureEvent);
+    CFRelease(gestureEvent);
+}
+
+static void stopZoomImmediately(int cancelPhase) {
+    if (zoomPhaseState == 1) {
+        emitMagnifyEvent(0.0, cancelPhase ? kCGScrollPhaseCancelled : kCGScrollPhaseEnded);
+    }
+    zoomPhaseState = 0;
+    zoomTouchContactActive = 0;
+    zoomTargetBuffer = 0.0;
+    pinchStreak = 0;
+}
+
+static int emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint32_t momentumPhase) {
     int natural = atomic_load_explicit(&naturalScrollingSetting, memory_order_relaxed);
     // Trục X của MultitouchSupport tăng từ trái (0.0) sang phải (1.0), cùng chiều dương với scrollingDeltaX khi bật Natural Scrolling
     double directedX = natural ? stepX : -stepX;
     // Trục Y của MultitouchSupport tăng từ dưới (0.0) lên trên (1.0), ngược chiều dương với scrollingDeltaY khi bật Natural Scrolling
     double directedY = natural ? -stepY : stepY;
 
+    int isClosingEvent = (phase == kCGScrollPhaseEnded ||
+                          phase == kCGScrollPhaseCancelled ||
+                          momentumPhase == kCGMomentumScrollPhaseEnd);
+
     int32_t ptX = 0;
     int32_t ptY = 0;
 
-    if ((phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled || momentumPhase == kCGMomentumScrollPhaseEnd) &&
-        fabs(directedX) < 1e-4 && fabs(directedY) < 1e-4) {
+    if (isClosingEvent && fabs(directedX) < 1e-4 && fabs(directedY) < 1e-4) {
         subpixelRemX = 0.0;
         subpixelRemY = 0.0;
         directedX = 0.0;
@@ -183,6 +219,26 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
         double totalY = directedY + subpixelRemY;
         ptX = (int32_t)llround(totalX);
         ptY = (int32_t)llround(totalY);
+
+        // Đảm bảo sự kiện Began luôn có ít nhất ±1px trên trục chính để Microsoft Word không khóa nhầm trục dọc!
+        if (phase == kCGScrollPhaseBegan) {
+            if (fabs(totalY) >= fabs(totalX)) {
+                if (ptY == 0 && fabs(totalY) >= 0.25) ptY = (totalY >= 0.0) ? 1 : -1;
+                ptX = 0;
+                directedX = 0.0;
+            } else {
+                if (ptX == 0 && fabs(totalX) >= 0.25) ptX = (totalX >= 0.0) ? 1 : -1;
+                ptY = 0;
+                directedY = 0.0;
+            }
+        }
+
+        if (!isClosingEvent && ptX == 0 && ptY == 0) {
+            subpixelRemX = totalX;
+            subpixelRemY = totalY;
+            return 0;
+        }
+
         subpixelRemX = totalX - (double)ptX;
         subpixelRemY = totalY - (double)ptY;
     }
@@ -190,9 +246,9 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
     // 2 trục (wheelCount = 2): Axis 1 = Dọc (Y), Axis 2 = Ngang (X)
     CGEventRef scrollEvent = CGEventCreateScrollWheelEvent2(
         sharedHIDSource(), kCGScrollEventUnitPixel, 2, ptY, ptX, 0);
-    if (!scrollEvent) return;
+    if (!scrollEvent) return 0;
 
-    // Gỡ cờ Option (⌥) khỏi sự kiện cuộn để trình duyệt / VS Code / Figma không hiểu nhầm là phím tắt Zoom
+    // Gỡ cờ Option (⌥) khỏi sự kiện cuộn để trình duyệt / VS Code / Figma / Word không hiểu nhầm là phím tắt Zoom
     CGEventFlags flags = CGEventGetFlags(scrollEvent);
     if ((flags & kCGEventFlagMaskAlternate) &&
         !(flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl))) {
@@ -211,8 +267,9 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
         CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventMomentumPhase, momentumPhase);
     }
 
-    // Lưu ý: KHÔNG gọi CGEventSetIntegerValueField(..., kCGScrollWheelEventDeltaAxis1/2, ...) sau PointDeltaAxis1/2
-    // vì CoreGraphics sẽ ghi đè PointDeltaAxis về ±8 và FixedPtDeltaAxis về ±1.0!
+    // Đặt DeltaAxis1/2 TRƯỚC PointDeltaAxis1/2 và FixedPtDeltaAxis1/2 để tương thích cả Microsoft Word lẫn Chrome/Safari
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis1, ptY > 0 ? 1 : (ptY < 0 ? -1 : 0));
+    CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventDeltaAxis2, ptX > 0 ? 1 : (ptX < 0 ? -1 : 0));
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis1, ptY);
     CGEventSetIntegerValueField(scrollEvent, kCGScrollWheelEventPointDeltaAxis2, ptX);
     CGEventSetDoubleValueField(scrollEvent, kCGScrollWheelEventFixedPtDeltaAxis1, directedY);
@@ -222,9 +279,12 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
     CGEventPost(kCGSessionEventTap, scrollEvent);
     CFRelease(scrollEvent);
 
-    // Phát kèm sự kiện NSEventTypeGesture (type = 29, field 110 = 6 = kIOHIDEventTypeScroll)
-    // để -[NSEvent trackSwipeEventWithOptions:...] trong Safari & Chrome tích lũy gestureAmount cho cử chỉ vuốt Back/Forward
-    if (phase == kCGScrollPhaseChanged || phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled) {
+    // Chỉ phát kèm NSEventTypeGesture (type = 29, field 110 = 6) khi đang vuốt NGANG (Back/Forward trình duyệt)
+    if (phase == kCGScrollPhaseBegan && abs(ptX) > abs(ptY)) {
+        mosHorizontalSwipeActive = 1;
+    }
+    if (mosHorizontalSwipeActive &&
+        (phase == kCGScrollPhaseChanged || phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled)) {
         CGEventRef gestureEvent = CGEventCreate(sharedHIDSource());
         if (gestureEvent) {
             CGEventSetType(gestureEvent, (CGEventType)29);
@@ -235,13 +295,17 @@ static void emitMosScrollEvent(double stepX, double stepY, uint32_t phase, uint3
             CGEventSetIntegerValueField(gestureEvent, 110, 6); // kCGEventGestureHIDType = 6 (Scroll Gesture)
             CGEventSetIntegerValueField(gestureEvent, 132, phase); // Gesture Phase (2=Changed, 4=Ended, 8=Cancelled)
             CGEventSetDoubleValueField(gestureEvent, 118, directedX * 1.85); // Horizontal Swipe Delta
-            CGEventSetDoubleValueField(gestureEvent, 119, directedY);        // Vertical Swipe Delta
+            CGEventSetDoubleValueField(gestureEvent, 119, 0.0);              // Vertical Swipe Delta = 0
             CGEventSetIntegerValueField(gestureEvent, 137, natural ? 1 : 0); // isDirectionInvertedFromDevice
             CGEventSetIntegerValueField(gestureEvent, kCGEventSourceUserData, MOS_PASS_MAGIC);
             CGEventPost(kCGSessionEventTap, gestureEvent);
             CFRelease(gestureEvent);
         }
+        if (phase == kCGScrollPhaseEnded || phase == kCGScrollPhaseCancelled) {
+            mosHorizontalSwipeActive = 0;
+        }
     }
+    return 1;
 }
 
 static void stopMosScrollImmediately(int cancelTouchPhase) {
@@ -252,6 +316,7 @@ static void stopMosScrollImmediately(int cancelTouchPhase) {
     }
     mosPhaseState = 0;
     mosTouchContactActive = 0;
+    mosHorizontalSwipeActive = 0;
     mosDashMomentum = 0;
     mosTargetBufferX = 0.0;
     mosTargetBufferY = 0.0;
@@ -263,6 +328,7 @@ static void stopMosScrollImmediately(int cancelTouchPhase) {
     subpixelRemY = 0.0;
     scrollIntentX = 0.0;
     scrollIntentY = 0.0;
+    scrollStreak = 0;
 }
 
 static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy) {
@@ -331,13 +397,26 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     double now = nowMs();
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
     double elapsedMulti = now - atomic_load_explicit(&lastMultiTouchT, memory_order_relaxed);
-    double elapsedAny = now - atomic_load_explicit(&lastAnyJomaaTouchT, memory_order_relaxed);
     int isMultiTouch = atomic_load_explicit(&multiTouchActive, memory_order_relaxed) && (elapsedMulti < 65.0);
 
+    // Chặn sự kiện cuộn thô từ phần cứng Jomaa (IsContinuous != 0) khi đang dùng >= 2 ngón,
+    // nhưng CHO QUA 100% con lăn chuột rời (IsContinuous == 0)!
     if (type == kCGEventScrollWheel) {
-        if (isMultiTouch || isDragging || elapsedAny < 300.0) {
+        if (CGEventGetIntegerValueField(event, kCGScrollWheelEventIsContinuous) != 0) {
+            if (isMultiTouch || isDragging || elapsedMulti < 320.0) {
+                return NULL;
+            }
+        }
+        return event;
+    }
+
+    // Chặn sự kiện Zoom phần cứng bị trễ/khựng của Jomaa để bộ nội suy 120Hz Pinch-to-Zoom đảm nhiệm mượt mà
+    if (type == (CGEventType)29) {
+        int64_t hidType = CGEventGetIntegerValueField(event, 110);
+        if (hidType == 8 && (isMultiTouch || elapsedMulti < 320.0)) {
             return NULL;
         }
+        return event;
     }
 
     if (isMultiTouch || isDragging) {
@@ -386,6 +465,77 @@ static int computeMatchedFingerDelta(const TouchPos *curr, int currN,
         *outDy = 0.0;
     }
     return matched;
+}
+
+// Phân rã động học 2 ngón tay: Tách biệt Tịnh tiến song song (Scroll) và Co giãn bán kính (Pinch-to-Zoom)
+static int computeTwoFingerKinematics(const TouchPos *curr, int currN,
+                                      const TouchPos *prev, int prevN,
+                                      double *outAvgDx, double *outAvgDy,
+                                      double *outRadialDelta, double *outPinchPurity,
+                                      double *outCosSim) {
+    *outAvgDx = 0.0;
+    *outAvgDy = 0.0;
+    *outRadialDelta = 0.0;
+    *outPinchPurity = 0.0;
+    *outCosSim = 1.0;
+
+    if (currN < 2 || prevN < 2) {
+        return computeMatchedFingerDelta(curr, currN, prev, prevN, outAvgDx, outAvgDy);
+    }
+
+    int cIdx[2] = {-1, -1};
+    int pIdx[2] = {-1, -1};
+    int matched = 0;
+
+    for (int i = 0; i < currN && matched < 2; i++) {
+        for (int j = 0; j < prevN; j++) {
+            if (curr[i].identifier == prev[j].identifier) {
+                double dx = curr[i].x - prev[j].x;
+                double dy = curr[i].y - prev[j].y;
+                if (fabs(dx) < 0.15 && fabs(dy) < 0.15) {
+                    cIdx[matched] = i;
+                    pIdx[matched] = j;
+                    matched++;
+                }
+                break;
+            }
+        }
+    }
+
+    if (matched < 2) {
+        return computeMatchedFingerDelta(curr, currN, prev, prevN, outAvgDx, outAvgDy);
+    }
+
+    double dx0 = curr[cIdx[0]].x - prev[pIdx[0]].x;
+    double dy0 = curr[cIdx[0]].y - prev[pIdx[0]].y;
+    double dx1 = curr[cIdx[1]].x - prev[pIdx[1]].x;
+    double dy1 = curr[cIdx[1]].y - prev[pIdx[1]].y;
+
+    *outAvgDx = 0.5 * (dx0 + dx1);
+    *outAvgDy = 0.5 * (dy0 + dy1);
+
+    double prevDist = hypot(prev[pIdx[1]].x - prev[pIdx[0]].x, prev[pIdx[1]].y - prev[pIdx[0]].y);
+    double currDist = hypot(curr[cIdx[1]].x - curr[cIdx[0]].x, curr[cIdx[1]].y - curr[cIdx[0]].y);
+    double radialDelta = currDist - prevDist;
+    *outRadialDelta = radialDelta;
+
+    double d0 = hypot(dx0, dy0);
+    double d1 = hypot(dx1, dy1);
+    double totalMotion = d0 + d1;
+    if (totalMotion > 1e-6) {
+        double purity = fabs(radialDelta) / totalMotion;
+        if (purity > 1.0) purity = 1.0;
+        *outPinchPurity = purity;
+    }
+
+    if (d0 > 1e-5 && d1 > 1e-5) {
+        *outCosSim = (dx0 * dx1 + dy0 * dy1) / (d0 * d1);
+    } else if (totalMotion > 1e-5) {
+        // 1 ngón làm trụ (ngón cái đứng yên), 1 ngón di chuyển
+        *outCosSim = 0.0;
+    }
+
+    return 2;
 }
 
 static void releaseDragAndUnlockCursorLocked(void) {
@@ -459,7 +609,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     if (currCount >= 2 || isDragging) {
         atomic_store_explicit(&multiTouchActive, 1, memory_order_relaxed);
         atomic_store_explicit(&lastMultiTouchT, tn, memory_order_relaxed);
-    } else if (currCount == 1 && !mosTouchContactActive) {
+    } else if (currCount == 1 && !mosTouchContactActive && !zoomTouchContactActive) {
         atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
     }
 
@@ -486,6 +636,8 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
 
                 if (dist >= 1.0) {
                     stopMosScrollImmediately(1);
+                    stopZoomImmediately(1);
+                    twoFingerMode = 0;
 
                     CGPoint pNow = cursorNow();
                     curX = pNow.x;
@@ -514,25 +666,26 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             armSince = 0.0;
         }
 
-        // --- 2. THUẬT TOÁN CUỘN MƯỢT 2 NGÓN 2 CHIỀU (NGANG & DỌC + OPTION DASH KIỂU MOS) ---
+        // --- 2. BỘ ĐỊNH TUYẾN ĐỘNG HỌC 2 NGÓN 120Hz: CUỘN MƯỢT 2 CHIỀU vs PINCH-TO-ZOOM ---
         double timeSinceTwoFingers = tn - lastTwoFingerT;
-        int isTwoFingerScroll = 0;
+        int isTwoFingerActive = 0;
 
         if (!isDragging) {
             if (currCount == 2) {
-                isTwoFingerScroll = 1;
+                isTwoFingerActive = 1;
                 lastTwoFingerT = tn;
-            } else if (currCount == 1 && mosTouchContactActive && timeSinceTwoFingers < 60.0) {
-                isTwoFingerScroll = 1;
+            } else if (currCount == 1 && (mosTouchContactActive || zoomTouchContactActive) && timeSinceTwoFingers < 55.0) {
+                isTwoFingerActive = 1;
             }
         }
 
-        if (isTwoFingerScroll) {
-            if (!mosTouchContactActive) {
+        if (isTwoFingerActive) {
+            if (!mosTouchContactActive && !zoomTouchContactActive) {
                 if (mosPhaseState == 2) {
                     emitMosScrollEvent(0.0, 0.0, 0, kCGMomentumScrollPhaseEnd);
                 }
                 mosPhaseState = 0;
+                mosHorizontalSwipeActive = 0;
                 mosTargetBufferX = 0.0;
                 mosTargetBufferY = 0.0;
                 mosVelocityPerTickX = 0.0;
@@ -545,53 +698,122 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                 scrollIntentY = 0.0;
                 mosDashMomentum = isOptionDashActive();
                 mosTouchContactActive = 1;
+
+                zoomPhaseState = 0;
+                zoomTargetBuffer = 0.0;
+                zoomTouchContactActive = 0;
+                twoFingerMode = 0;
+                pinchStreak = 0;
+                scrollStreak = 0;
             }
 
             double matchedDx = 0.0, matchedDy = 0.0;
+            double radialDelta = 0.0, pinchPurity = 0.0, cosSim = 1.0;
             int checkFingers = (currCount == 1) ? 1 : 2;
-            int matchedCount = computeMatchedFingerDelta(currTouches, checkFingers, prevTouches, prevCount, &matchedDx, &matchedDy);
+            int matchedCount = computeTwoFingerKinematics(
+                currTouches, checkFingers, prevTouches, prevCount,
+                &matchedDx, &matchedDy, &radialDelta, &pinchPurity, &cosSim);
 
             if (matchedCount > 0) {
                 double dt = tn - lastScrollFrameT;
                 if (dt < 4.0) dt = 4.0;
                 if (dt > 45.0) dt = 12.0;
 
-                if (hypot(matchedDx, matchedDy) > 0.00003) {
-                    double sens = atomic_load_explicit(&sensitivityMultiplier, memory_order_relaxed);
-                    if (sens < 0.2) sens = 0.2;
-                    if (sens > 4.0) sens = 4.0;
+                double panMag = hypot(matchedDx, matchedDy);
+                double pinchMag = fabs(radialDelta);
 
+                // Phân loại tức thì giữa Pinch-to-Zoom (co giãn khoảng cách 2 ngón) và Scroll (tịnh tiến song song)
+                if (matchedCount == 2 && (panMag > 0.00003 || pinchMag > 0.00005)) {
+                    int isPinchFrame = ((pinchPurity >= 0.56 && cosSim <= 0.22 && pinchMag > panMag * 1.10 && pinchMag > 0.00028) ||
+                                        (cosSim < -0.22 && pinchMag > panMag * 0.85 && pinchMag > 0.00025));
+                    int isScrollFrame = ((pinchPurity < 0.42 && panMag > 0.00018) ||
+                                         (cosSim > 0.38 && panMag > pinchMag * 1.15 && panMag > 0.00018));
+
+                    if (twoFingerMode == 0) {
+                        if (isPinchFrame) {
+                            twoFingerMode = 2;
+                            zoomTouchContactActive = 1;
+                            mosTouchContactActive = 0;
+                        } else if (isScrollFrame) {
+                            twoFingerMode = 1;
+                            mosTouchContactActive = 1;
+                        }
+                    } else if (twoFingerMode == 1) {
+                        // Cho phép chuyển mượt từ Scroll sang Pinch-to-Zoom nếu người dùng chụm/bung 2 ngón rõ rệt
+                        if (isPinchFrame && pinchPurity >= 0.65 && pinchMag > 0.00075) {
+                            pinchStreak++;
+                            if (pinchStreak >= 2) {
+                                stopMosScrollImmediately(0);
+                                twoFingerMode = 2;
+                                zoomTouchContactActive = 1;
+                                zoomPhaseState = 0;
+                                zoomTargetBuffer = 0.0;
+                            }
+                        } else {
+                            pinchStreak = 0;
+                        }
+                    } else if (twoFingerMode == 2) {
+                        // Cho phép chuyển từ Pinch-to-Zoom sang Scroll nếu 2 ngón lướt song song rõ rệt
+                        if (isScrollFrame && cosSim > 0.55 && pinchPurity < 0.28 && panMag > 0.0016) {
+                            scrollStreak++;
+                            if (scrollStreak >= 3) {
+                                stopZoomImmediately(0);
+                                twoFingerMode = 1;
+                                mosTouchContactActive = 1;
+                                mosPhaseState = 0;
+                            }
+                        } else {
+                            scrollStreak = 0;
+                        }
+                    }
+                }
+
+                double sens = atomic_load_explicit(&sensitivityMultiplier, memory_order_relaxed);
+                if (sens < 0.2) sens = 0.2;
+                if (sens > 4.0) sens = 4.0;
+
+                if (twoFingerMode == 2 && matchedCount == 2) {
+                    // --- NHÁNH 2A: NỘI SUY 120Hz PINCH-TO-ZOOM (MƯỢT NHƯ TRACKPAD MACBOOK) ---
+                    if (pinchMag > 0.00004) {
+                        double rawPinchVel = pinchMag / dt;
+                        double pinchGain = 1.0 + fmin(rawPinchVel * 180.0, 0.85);
+                        double deltaMag = radialDelta * (2.65 * sqrt(sens)) * pinchGain;
+
+                        if ((deltaMag > 0.002 && zoomTargetBuffer < -0.0015) ||
+                            (deltaMag < -0.002 && zoomTargetBuffer > 0.0015)) {
+                            zoomTargetBuffer = deltaMag;
+                        } else {
+                            zoomTargetBuffer += deltaMag;
+                        }
+                        if (zoomTargetBuffer > 0.85) zoomTargetBuffer = 0.85;
+                        if (zoomTargetBuffer < -0.85) zoomTargetBuffer = -0.85;
+                    }
+                } else if (twoFingerMode != 2 && panMag > 0.00003) {
+                    // --- NHÁNH 2B: NỘI SUY 120Hz CUỘN 2 CHIỀU (NGANG & DỌC + OPTION DASH) ---
                     int dashActive = isOptionDashActive();
                     if (dashActive) mosDashMomentum = 1;
                     double dashBoost = dashActive ? 3.2 : 1.0;
-                    double maxBuf = dashActive ? 1800.0 : 600.0;
+                    double maxBuf = dashActive ? 1800.0 : 650.0;
 
-                    // Ổn định hướng vuốt ngang/dọc: khóa cứng trục phụ để kích hoạt vuốt Back/Forward trình duyệt chuẩn xác
-                    double ax = fabs(matchedDx) * 1.25;
+                    double ax = fabs(matchedDx);
                     double ay = fabs(matchedDy);
                     scrollIntentX = scrollIntentX * 0.72 + ax * 0.28;
                     scrollIntentY = scrollIntentY * 0.72 + ay * 0.28;
 
-                    if (scrollIntentX > scrollIntentY * 1.35 || ax > ay * 1.60) {
-                        matchedDy = 0.0;
-                        mosTargetBufferY = 0.0;
-                        mosVelocityPerTickY = 0.0;
-                        subpixelRemY = 0.0;
-                    } else if (scrollIntentY > scrollIntentX * 1.50 || ay > ax * 1.80) {
+                    // Khóa trục thông minh KHÔNG xóa bộ đệm đang trôi
+                    if (scrollIntentY > scrollIntentX * 1.30 || ay > ax * 1.50) {
                         matchedDx = 0.0;
-                        mosTargetBufferX = 0.0;
-                        mosVelocityPerTickX = 0.0;
-                        subpixelRemX = 0.0;
+                    } else if (scrollIntentX > scrollIntentY * 1.30 || ax > ay * 1.50) {
+                        matchedDy = 0.0;
                     }
 
-                    // Gia tốc theo tốc độ vuốt cho cả trục X (ngang) và Y (dọc) + hệ số Option Dash
                     double rawVelX = fabs(matchedDx) / dt;
-                    double flickGainX = 1.0 + fmin(rawVelX * 480.0, 1.40);
-                    double deltaPixelsX = matchedDx * (880.0 * sens) * flickGainX * dashBoost;
+                    double flickGainX = 1.0 + fmin(rawVelX * 520.0, 1.65);
+                    double deltaPixelsX = matchedDx * (1080.0 * sens) * flickGainX * dashBoost;
 
                     double rawVelY = fabs(matchedDy) / dt;
-                    double flickGainY = 1.0 + fmin(rawVelY * 480.0, 1.40);
-                    double deltaPixelsY = matchedDy * (780.0 * sens) * flickGainY * dashBoost;
+                    double flickGainY = 1.0 + fmin(rawVelY * 520.0, 1.65);
+                    double deltaPixelsY = matchedDy * (1050.0 * sens) * flickGainY * dashBoost;
 
                     // Đảo chiều tức thì trên trục X
                     if ((deltaPixelsX > 2.0 && mosTargetBufferX < -1.5) ||
@@ -633,8 +855,12 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             }
             lastScrollFrameT = tn;
         } else if (!isDragging && currCount < 2) {
-            if (mosTouchContactActive && timeSinceTwoFingers >= 60.0) {
+            if ((mosTouchContactActive || zoomTouchContactActive) && timeSinceTwoFingers >= 55.0) {
+                if (zoomTouchContactActive) {
+                    stopZoomImmediately(0);
+                }
                 mosTouchContactActive = 0;
+                twoFingerMode = 0;
                 atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
             }
             if (currCount == 1 && mosPhaseState == 2 && timeSinceTwoFingers > 110.0) {
@@ -699,6 +925,8 @@ static void stopDrag(const char *why) {
     }
     prevCount = 0;
     stopMosScrollImmediately(1);
+    stopZoomImmediately(1);
+    twoFingerMode = 0;
     CGPoint p = CGPointMake(curX, curY);
     releaseDragAndUnlockCursorLocked();
     pthread_mutex_unlock(&mu);
@@ -732,7 +960,6 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
 
     // 1. Khi người dùng đang KÉO 3 NGÓN:
     if (isDragging) {
-        // Tăng hệ số xả lên 0.75 để cửa sổ vọt theo tay nhanh và sát hơn:
         if (fabs(dragTargetDx) >= 0.05 || fabs(dragTargetDy) >= 0.05) {
             dragEmitDx = dragTargetDx * 0.75;
             dragEmitDy = dragTargetDy * 0.75;
@@ -751,9 +978,19 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
     }
 
-    // 2. Khi người dùng nhấc 2 ngón tay khỏi bàn rê (Cuộn trang 2 chiều):
+    // 2A. Khi người dùng nhấc 2 ngón tay sau khi PINCH-TO-ZOOM:
+    if (!isDragging && zoomTouchContactActive && twoFingerGap >= 38.0) {
+        stopZoomImmediately(0);
+        twoFingerMode = 0;
+        if (!mosTouchContactActive) {
+            atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
+        }
+    }
+
+    // 2B. Khi người dùng nhấc 2 ngón tay khỏi bàn rê (Cuộn trang 2 chiều):
     if (!isDragging && mosTouchContactActive && twoFingerGap >= 38.0) {
         mosTouchContactActive = 0;
+        twoFingerMode = 0;
         atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
 
         double launchVelX = mosVelocityPerTickX;
@@ -762,9 +999,9 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
             if (fabs(mosPeakVelPerTickX) > fabs(launchVelX)) launchVelX = mosPeakVelPerTickX;
             if (fabs(mosPeakVelPerTickY) > fabs(launchVelY)) launchVelY = mosPeakVelPerTickY;
         }
-        if (fabs(launchVelX) > fabs(launchVelY) * 1.35) {
+        if (fabs(launchVelX) > fabs(launchVelY) * 1.30) {
             launchVelY = 0.0;
-        } else if (fabs(launchVelY) > fabs(launchVelX) * 1.50) {
+        } else if (fabs(launchVelY) > fabs(launchVelX) * 1.30) {
             launchVelX = 0.0;
         }
 
@@ -777,7 +1014,7 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
         double maxLaunchVel = mosDashMomentum ? 125.0 : 42.0;
 
-        if (hypot(launchVelX, launchVelY) >= 1.0) {
+        if (hypot(launchVelX, launchVelY) >= 1.2) {
             mosVelocityPerTickX = fmin(fmax(launchVelX, -maxLaunchVel), maxLaunchVel);
             mosVelocityPerTickY = fmin(fmax(launchVelY, -maxLaunchVel), maxLaunchVel);
             mosPhaseState = 2;
@@ -796,36 +1033,45 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         mosPeakVelPerTickY = 0.0;
     }
 
-    if (touchGap >= 45.0 && !isDragging && !mosTouchContactActive) {
+    if (touchGap >= 45.0 && !isDragging && !mosTouchContactActive && !zoomTouchContactActive) {
         latestPresent = 0;
         dragArmed = 0;
+        twoFingerMode = 0;
         atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
     }
 
-    // 3A. Khi 2 ngón tay ĐANG CHẠM bàn rê:
-    if (!isDragging && mosTouchContactActive) {
-        if (fabs(mosTargetBufferX) >= 0.06 || fabs(mosTargetBufferY) >= 0.06) {
+    // 3A. Khi 2 ngón tay ĐANG PINCH-TO-ZOOM ở 120Hz:
+    if (!isDragging && zoomTouchContactActive) {
+        if (fabs(zoomTargetBuffer) >= 0.00025) {
+            double stepMag = zoomTargetBuffer * 0.44;
+            zoomTargetBuffer -= stepMag;
+            uint32_t phase = (zoomPhaseState == 0) ? kCGScrollPhaseBegan : kCGScrollPhaseChanged;
+            zoomPhaseState = 1;
+            emitMagnifyEvent(stepMag, phase);
+        }
+    }
+    // 3B. Khi 2 ngón tay ĐANG CHẠM bàn rê để CUỘN 2 CHIỀU ở 120Hz:
+    else if (!isDragging && mosTouchContactActive) {
+        double minTrigger = (mosPhaseState == 0) ? 0.65 : 0.12;
+        if (fabs(mosTargetBufferX) >= minTrigger || fabs(mosTargetBufferY) >= minTrigger) {
             double stepX = mosTargetBufferX * 0.36;
             double stepY = mosTargetBufferY * 0.35;
             mosTargetBufferX -= stepX;
             mosTargetBufferY -= stepY;
 
-            if (fabs(stepX) > fabs(stepY) * 1.35) {
-                stepY = 0.0;
-                mosTargetBufferY = 0.0;
-                subpixelRemY = 0.0;
-            } else if (fabs(stepY) > fabs(stepX) * 1.50) {
+            if (fabs(stepY) >= fabs(stepX) * 1.25) {
                 stepX = 0.0;
-                mosTargetBufferX = 0.0;
-                subpixelRemX = 0.0;
+            } else if (fabs(stepX) > fabs(stepY) * 1.25) {
+                stepY = 0.0;
             }
 
             uint32_t phase = (mosPhaseState == 0) ? kCGScrollPhaseBegan : kCGScrollPhaseChanged;
-            mosPhaseState = 1;
-            emitMosScrollEvent(stepX, stepY, phase, 0);
+            if (emitMosScrollEvent(stepX, stepY, phase, 0)) {
+                mosPhaseState = 1;
+            }
         }
     }
-    // 3B. Khi ĐÃ NHẤC TAY (Pha trôi quán tính Momentum 2 chiều + Option Dash):
+    // 3C. Khi ĐÃ NHẤC TAY (Pha trôi quán tính Momentum 2 chiều + Option Dash):
     else if (!isDragging && !mosTouchContactActive && mosPhaseState == 2) {
         double speedMag = hypot(mosVelocityPerTickX, mosVelocityPerTickY);
         double speedRatio = fmin(speedMag / (mosDashMomentum ? 36.0 : 18.0), 1.0);
@@ -835,7 +1081,7 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         mosVelocityPerTickX *= decay;
         mosVelocityPerTickY *= decay;
 
-        if (hypot(mosVelocityPerTickX, mosVelocityPerTickY) >= 0.16) {
+        if (hypot(mosVelocityPerTickX, mosVelocityPerTickY) >= 0.35) {
             emitMosScrollEvent(mosVelocityPerTickX, mosVelocityPerTickY, 0, kCGMomentumScrollPhaseContinue);
         } else {
             emitMosScrollEvent(0.0, 0.0, 0, kCGMomentumScrollPhaseEnd);
@@ -866,7 +1112,8 @@ static BOOL trySetupEventTap(void) {
                        CGEventMaskBit(kCGEventMouseMoved) |
                        CGEventMaskBit(kCGEventLeftMouseDragged) |
                        CGEventMaskBit(kCGEventRightMouseDragged) |
-                       CGEventMaskBit(kCGEventOtherMouseDragged);
+                       CGEventMaskBit(kCGEventOtherMouseDragged) |
+                       CGEventMaskBit((CGEventType)29);
     eventTap = CGEventTapCreate(kCGHIDEventTap, kCGHeadInsertEventTap,
                                 kCGEventTapOptionDefault, mask, mouseEventTap, NULL);
     if (eventTap) {
