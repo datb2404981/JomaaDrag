@@ -1,4 +1,4 @@
-.PHONY: all build install clean
+.PHONY: all build install clean test
 
 all: build
 
@@ -7,6 +7,9 @@ build:
 
 install:
 	@./scripts/install.sh
+
+test:
+	@bash scripts/test.sh
 
 clean:
 	@rm -rf build

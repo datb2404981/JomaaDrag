@@ -8,6 +8,23 @@
 
 ---
 
+## Current release: 15.1
+
+The `release/15.1-current` branch preserves the source of the installed 15.1
+application, including two-axis scrolling, browser swipes, Option Dash, pinch
+zoom, and the gesture/lifecycle fixes in [CHANGES-15.1.md](CHANGES-15.1.md).
+
+The original 15.1 build and the installed executable were verified to have the
+same SHA-256 digest:
+`2413de1b2bbc48061302c003bd732d237e37ebb27dad7f8081b0101a281201cb`.
+Rebuilding with a different toolchain or code signature may produce another
+digest. Build artifacts, backups, logs, and user preferences are not included.
+
+Run `make test` for the 10 gesture/lifecycle regression scenarios. Tests intercept
+generated input and cursor changes, and run with AddressSanitizer and
+UndefinedBehaviorSanitizer. Run `make build` to build and sign the app without
+installing it. Hardware gesture feel still requires interactive validation.
+
 ## 🌟 Overview
 
 **JomaaDrag** is a lightweight, high-performance macOS menu bar utility and driver designed specifically for external multi-touch trackpads (such as the **Jomaa KB96 trackpad**).

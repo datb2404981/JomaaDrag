@@ -26,7 +26,8 @@ fi
 
 # Compile Objective-C source
 echo "📦 Compiling binary with Clang..."
-clang -O2 -fobjc-arc "${PROJECT_DIR}/src/main.m" \
+clang -O2 -fobjc-arc -mmacosx-version-min=12.0 \
+  -Wall -Wextra -Wno-unused-parameter -Werror "${PROJECT_DIR}/src/main.m" \
   -framework Cocoa \
   -framework ApplicationServices \
   -framework CoreFoundation \

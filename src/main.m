@@ -11,6 +11,7 @@
 #import <string.h>
 #import <stdint.h>
 #import <unistd.h>
+#import <time.h>
 
 // Private MultitouchSupport.framework API
 typedef void *MTDeviceRef;
@@ -69,34 +70,33 @@ static int readNaturalScrolling(void) {
     CFPreferencesAppSynchronize(CFSTR(".GlobalPreferences"));
     CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("com.apple.swipescrolldirection"), CFSTR(".GlobalPreferences"));
     int nat = 1;
-    if (val) {
+    if (val && CFGetTypeID(val) == CFBooleanGetTypeID()) {
         nat = CFBooleanGetValue((CFBooleanRef)val) ? 1 : 0;
-        CFRelease(val);
     }
+    if (val) CFRelease(val);
     return nat;
 }
 
 // Trạng thái đồng bộ
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int dragging = 0;
-static volatile sig_atomic_t stopRequested = 0;
+static _Atomic int stopRequested = 0;
+static _Atomic int eventPipelineReady = 0;
+static _Atomic int engineSuspended = 0;
+static volatile sig_atomic_t terminationRequested = 0;
+// Protected by mu. Close this gate before unregistering/stopping a device.
+static int acceptingTouches = 0;
 
 static double lastTouchT = 0.0;
 static double lastDragContactT = 0.0;
 static double singleFingerSinceT = 0.0;
 static double singleFingerStartX = 0.0;
 static double singleFingerStartY = 0.0;
-static double armSince = 0.0;
 static int latestPresent = 0;
-static double tRef = 0.0;
 
 // Vị trí con trỏ & Bộ đệm Nội suy Kéo 3 ngón 120Hz
 static double curX = 0.0, curY = 0.0;
 static double dragTargetDx = 0.0, dragTargetDy = 0.0;
-static double prevDragCentroidX = 0.0;
-static double prevDragCentroidY = 0.0;
-static int prevDragFingerCount = 0;
-static int dragCentroidValid = 0;
 
 #define MAX_TOUCHES 8
 typedef struct {
@@ -141,7 +141,9 @@ static int pinchStreak = 0;
 static int scrollStreak = 0;
 
 static inline double nowMs(void) {
-    return CFAbsoluteTimeGetCurrent() * 1000.0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
 static CGEventSourceRef sharedHIDSource(void) {
@@ -356,8 +358,8 @@ static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy
 }
 
 // Trạng thái khởi động kéo 3 ngón
-static double dragCentroidStartX = 0.0;
-static double dragCentroidStartY = 0.0;
+static double dragArmDx = 0.0;
+static double dragArmDy = 0.0;
 static int dragArmed = 0;
 
 static CFMachPortRef eventTap = NULL;
@@ -367,15 +369,23 @@ static CFArrayRef deviceListRef = NULL;
 static int attached = 0;
 static uint64_t connectedDeviceId = 0;
 static MTDeviceRef connectedDeviceRef = NULL;
+static void stopDrag(const char *why);
+
+static int multitouchAPIReady(void) {
+    return MTDeviceCreateList && MTRegisterContactFrameCallback &&
+           MTUnregisterContactFrameCallback && MTDeviceStart && MTDeviceStop &&
+           MTDeviceGetDeviceID && MTDeviceIsBuiltIn;
+}
 
 static double readSystemTrackpadScaling(void) {
     CFPreferencesAppSynchronize(CFSTR(".GlobalPreferences"));
     CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("com.apple.trackpad.scaling"), CFSTR(".GlobalPreferences"));
     double scaling = 2.0;
-    if (val) {
-        scaling = [(__bridge NSNumber *)val doubleValue];
-        CFRelease(val);
+    if (val && CFGetTypeID(val) == CFNumberGetTypeID()) {
+        CFNumberGetValue((CFNumberRef)val, kCFNumberDoubleType, &scaling);
     }
+    if (val) CFRelease(val);
+    if (!isfinite(scaling)) scaling = 2.0;
     if (scaling < 0.1) scaling = 0.1;
     if (scaling > 6.0) scaling = 6.0;
     return scaling;
@@ -386,7 +396,12 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
     (void)proxy; (void)refcon;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
-        if (eventTap) CGEventTapEnable(eventTap, true);
+        atomic_store(&eventPipelineReady, 0);
+        stopDrag("Event tap bị ngắt");
+        if (eventTap && AXIsProcessTrusted() && !atomic_load(&stopRequested)) {
+            CGEventTapEnable(eventTap, true);
+            atomic_store(&eventPipelineReady, CGEventTapIsEnabled(eventTap));
+        }
         return event;
     }
     if (!event) return event;
@@ -540,14 +555,27 @@ static int computeTwoFingerKinematics(const TouchPos *curr, int currN,
 
 static void releaseDragAndUnlockCursorLocked(void) {
     dragArmed = 0;
-    armSince = 0.0;
+    dragArmDx = dragArmDy = 0.0;
     dragTargetDx = dragTargetDy = 0.0;
-    dragCentroidValid = 0;
-    prevDragFingerCount = 0;
     singleFingerSinceT = 0.0;
     atomic_store_explicit(&dragging, 0, memory_order_relaxed);
     atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
-    CGAssociateMouseAndMouseCursorPosition(true);
+}
+
+// Keep down/drag/up ordered under mu, including the final buffered movement.
+static void finishDragLocked(int flushPendingMovement) {
+    int wasDragging = atomic_load(&dragging);
+    if (wasDragging && flushPendingMovement &&
+        (fabs(dragTargetDx) >= 0.05 || fabs(dragTargetDy) >= 0.05)) {
+        curX += dragTargetDx;
+        curY += dragTargetDy;
+        postDragMouseEvent(kCGEventLeftMouseDragged, CGPointMake(curX, curY),
+                           dragTargetDx, dragTargetDy);
+    }
+    releaseDragAndUnlockCursorLocked();
+    if (wasDragging) {
+        postDragMouseEvent(kCGEventLeftMouseUp, CGPointMake(curX, curY), 0.0, 0.0);
+    }
 }
 
 static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame) {
@@ -555,12 +583,22 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     double tn = nowMs();
 
     pthread_mutex_lock(&mu);
+    // The private callback's device token is not stable across framework versions.
+    // Detach closes this gate and drains the old driver before reattaching.
+    if (!acceptingTouches || atomic_load(&stopRequested) || atomic_load(&engineSuspended) ||
+        !atomic_load(&eventPipelineReady) || n < 0 || (n > 0 && !t)) {
+        pthread_mutex_unlock(&mu);
+        return 0;
+    }
 
     TouchPos currTouches[MAX_TOUCHES];
     int currCount = 0;
     for (int i = 0; i < n && currCount < MAX_TOUCHES; i++) {
         int st = t[i].state;
-        if (st >= 1 && st <= 4) {
+        if (st >= 1 && st <= 4 && isfinite(t[i].normalized.pos.x) &&
+            isfinite(t[i].normalized.pos.y) && t[i].normalized.pos.x >= 0.0f &&
+            t[i].normalized.pos.x <= 1.0f && t[i].normalized.pos.y >= 0.0f &&
+            t[i].normalized.pos.y <= 1.0f) {
             currTouches[currCount].identifier = t[i].identifier;
             currTouches[currCount].x = t[i].normalized.pos.x;
             currTouches[currCount].y = t[i].normalized.pos.y;
@@ -593,16 +631,10 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                 double d1 = hypot(currTouches[0].x - singleFingerStartX,
                                   currTouches[0].y - singleFingerStartY) * SPEED_FACTOR;
                 if (((tn - singleFingerSinceT) >= 20.0 && d1 >= 1.0) || (tn - singleFingerSinceT) >= 45.0) {
-                    CGPoint upPos = CGPointMake(curX, curY);
-                    releaseDragAndUnlockCursorLocked();
+                    finishDragLocked(1);
                     isDragging = 0;
-                    pthread_mutex_unlock(&mu);
-                    postDragMouseEvent(kCGEventLeftMouseUp, upPos, 0.0, 0.0);
-                    pthread_mutex_lock(&mu);
                 }
             }
-        } else {
-            dragCentroidValid = 0;
         }
     }
 
@@ -616,23 +648,16 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     if (!isDragging) {
         // --- 1. XỬ LÝ KHỞI ĐỘNG KÉO 3 NGÓN ---
         if (currCount >= 3) {
-            double sumX = 0.0, sumY = 0.0;
-            for (int i = 0; i < currCount; i++) {
-                sumX += currTouches[i].x;
-                sumY += currTouches[i].y;
-            }
-            double curCentroidX = sumX / (double)currCount;
-            double curCentroidY = sumY / (double)currCount;
-
-            if (!dragArmed) {
-                dragCentroidStartX = curCentroidX;
-                dragCentroidStartY = curCentroidY;
+            double matchedDx = 0.0, matchedDy = 0.0;
+            int matched = computeMatchedFingerDelta(currTouches, currCount,
+                prevTouches, prevCount, &matchedDx, &matchedDy);
+            if (!dragArmed || currCount != prevCount || matched != currCount) {
+                dragArmDx = dragArmDy = 0.0;
                 dragArmed = 1;
-                armSince = tn;
             } else {
-                double dX = (curCentroidX - dragCentroidStartX) * SPEED_FACTOR;
-                double dY = -(curCentroidY - dragCentroidStartY) * SPEED_FACTOR;
-                double dist = sqrt(dX * dX + dY * dY);
+                dragArmDx += matchedDx;
+                dragArmDy += matchedDy;
+                double dist = hypot(dragArmDx, dragArmDy) * SPEED_FACTOR;
 
                 if (dist >= 1.0) {
                     stopMosScrollImmediately(1);
@@ -644,10 +669,6 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     curY = pNow.y;
                     dragTargetDx = 0.0;
                     dragTargetDy = 0.0;
-                    prevDragCentroidX = curCentroidX;
-                    prevDragCentroidY = curCentroidY;
-                    prevDragFingerCount = currCount;
-                    dragCentroidValid = 1;
                     lastDragContactT = tn;
                     singleFingerSinceT = 0.0;
                     dragArmed = 0;
@@ -655,15 +676,13 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     atomic_store_explicit(&dragging, 1, memory_order_relaxed);
                     isDragging = 1;
 
-                    pthread_mutex_unlock(&mu);
                     postDragMouseEvent(kCGEventLeftMouseDown, pNow, 0.0, 0.0);
                     postDragMouseEvent(kCGEventLeftMouseDragged, pNow, 0.0, 0.0);
-                    pthread_mutex_lock(&mu);
                 }
             }
         } else {
             dragArmed = 0;
-            armSince = 0.0;
+            dragArmDx = dragArmDy = 0.0;
         }
 
         // --- 2. BỘ ĐỊNH TUYẾN ĐỘNG HỌC 2 NGÓN 120Hz: CUỘN MƯỢT 2 CHIỀU vs PINCH-TO-ZOOM ---
@@ -870,22 +889,17 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     } else {
         // --- 3. ĐANG TRONG PHIÊN KÉO 3 NGÓN (TĂNG TỐC & GIA TỐC NHẠY BÉN) ---
         if (currCount >= 2) {
-            double sumX = 0.0, sumY = 0.0;
-            for (int i = 0; i < currCount; i++) {
-                sumX += currTouches[i].x;
-                sumY += currTouches[i].y;
-            }
-            double curCentroidX = sumX / (double)currCount;
-            double curCentroidY = sumY / (double)currCount;
-
-            if (dragCentroidValid && currCount == prevDragFingerCount) {
+            double matchedDx = 0.0, matchedDy = 0.0;
+            int matched = computeMatchedFingerDelta(currTouches, currCount,
+                prevTouches, prevCount, &matchedDx, &matchedDy);
+            if (matched >= 2) {
                 double sens = atomic_load_explicit(&sensitivityMultiplier, memory_order_relaxed);
                 if (sens < 0.2) sens = 0.2;
                 if (sens > 4.0) sens = 4.0;
 
                 double effectiveSpeed = SPEED_FACTOR * sens;
-                double rawDx = (curCentroidX - prevDragCentroidX) * effectiveSpeed;
-                double rawDy = -(curCentroidY - prevDragCentroidY) * effectiveSpeed;
+                double rawDx = matchedDx * effectiveSpeed;
+                double rawDy = -matchedDy * effectiveSpeed;
 
                 double dist = hypot(rawDx, rawDy);
                 if (dist < 220.0 && dist > 0.02) {
@@ -896,12 +910,6 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                 }
             }
 
-            prevDragCentroidX = curCentroidX;
-            prevDragCentroidY = curCentroidY;
-            prevDragFingerCount = currCount;
-            dragCentroidValid = 1;
-        } else {
-            dragCentroidValid = 0;
         }
     }
 
@@ -917,21 +925,16 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
 static void stopDrag(const char *why) {
     (void)why;
     pthread_mutex_lock(&mu);
-    if (!atomic_load_explicit(&dragging, memory_order_relaxed)) {
-        dragArmed = 0;
-        atomic_store_explicit(&multiTouchActive, 0, memory_order_relaxed);
-        pthread_mutex_unlock(&mu);
-        return;
-    }
     prevCount = 0;
     stopMosScrollImmediately(1);
     stopZoomImmediately(1);
     twoFingerMode = 0;
-    CGPoint p = CGPointMake(curX, curY);
-    releaseDragAndUnlockCursorLocked();
+    latestPresent = 0;
+    lastTouchT = lastDragContactT = lastTwoFingerT = lastScrollFrameT = 0.0;
+    atomic_store(&lastMultiTouchT, 0.0);
+    atomic_store(&lastAnyJomaaTouchT, 0.0);
+    finishDragLocked(0);
     pthread_mutex_unlock(&mu);
-
-    postDragMouseEvent(kCGEventLeftMouseUp, p, 0.0, 0.0);
 }
 
 // ============================================================================
@@ -940,16 +943,15 @@ static void stopDrag(const char *why) {
 static void tick(CFRunLoopTimerRef timerRef, void *info) {
     (void)timerRef; (void)info;
 
-    if (stopRequested) {
-        stopDrag("Dừng ứng dụng");
+    if (terminationRequested) {
+        [NSApp terminate:nil];
+        return;
+    }
+    if (atomic_load(&stopRequested) || atomic_load(&engineSuspended)) {
         return;
     }
 
     double tn = nowMs();
-    int stopNow = 0;
-    const char *stopWhy = NULL;
-    int emitDragNow = 0;
-    CGPoint dragEmitPos = CGPointZero;
     double dragEmitDx = 0.0, dragEmitDy = 0.0;
 
     pthread_mutex_lock(&mu);
@@ -960,6 +962,15 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
 
     // 1. Khi người dùng đang KÉO 3 NGÓN:
     if (isDragging) {
+        // Brief grace for lost sensor frames; release promptly after an explicit lift.
+        if ((latestPresent == 0 && dragContactGap >= 45.0) ||
+            (latestPresent == 1 && singleFingerSinceT > 0.0 && tn - singleFingerSinceT >= 45.0) ||
+            dragContactGap >= 380.0) {
+            finishDragLocked(1);
+            isDragging = 0;
+        }
+    }
+    if (isDragging && latestPresent >= 2) {
         if (fabs(dragTargetDx) >= 0.05 || fabs(dragTargetDy) >= 0.05) {
             dragEmitDx = dragTargetDx * 0.75;
             dragEmitDy = dragTargetDy * 0.75;
@@ -968,13 +979,8 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
 
             curX += dragEmitDx;
             curY += dragEmitDy;
-            dragEmitPos = CGPointMake(curX, curY);
-            emitDragNow = 1;
-        }
-
-        if (dragContactGap >= 380.0) {
-            stopNow = 1;
-            stopWhy = "Kết thúc phiên kéo 3 ngón";
+            postDragMouseEvent(kCGEventLeftMouseDragged, CGPointMake(curX, curY),
+                               dragEmitDx, dragEmitDy);
         }
     }
 
@@ -1092,19 +1098,31 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
     }
     pthread_mutex_unlock(&mu);
-
-    if (emitDragNow) {
-        postDragMouseEvent(kCGEventLeftMouseDragged, dragEmitPos, dragEmitDx, dragEmitDy);
-    }
-
-    if (stopNow) {
-        stopDrag(stopWhy ? stopWhy : "Dừng kéo");
-        return;
-    }
 }
 
 static BOOL trySetupEventTap(void) {
-    if (eventTap) return YES;
+    if (atomic_load(&stopRequested)) return NO;
+    if (!AXIsProcessTrusted()) {
+        atomic_store(&eventPipelineReady, 0);
+        stopDrag("Chưa có quyền Trợ năng");
+        if (eventTap && CFMachPortIsValid(eventTap)) CGEventTapEnable(eventTap, false);
+        return NO;
+    }
+    if (eventTap && CFMachPortIsValid(eventTap) && CGEventTapIsEnabled(eventTap)) {
+        atomic_store(&eventPipelineReady, 1);
+        return atomic_load(&eventPipelineReady) ? YES : NO;
+    }
+    atomic_store(&eventPipelineReady, 0);
+    if (eventTapSource) {
+        CFRunLoopSourceInvalidate(eventTapSource);
+        CFRelease(eventTapSource);
+        eventTapSource = NULL;
+    }
+    if (eventTap) {
+        CFMachPortInvalidate(eventTap);
+        CFRelease(eventTap);
+        eventTap = NULL;
+    }
 
     CGEventMask mask = CGEventMaskBit(kCGEventLeftMouseDown) |
                        CGEventMaskBit(kCGEventLeftMouseUp) |
@@ -1118,8 +1136,15 @@ static BOOL trySetupEventTap(void) {
                                 kCGEventTapOptionDefault, mask, mouseEventTap, NULL);
     if (eventTap) {
         eventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
+        if (!eventTapSource) {
+            CFMachPortInvalidate(eventTap);
+            CFRelease(eventTap);
+            eventTap = NULL;
+            return NO;
+        }
         CFRunLoopAddSource(CFRunLoopGetMain(), eventTapSource, kCFRunLoopCommonModes);
         CGEventTapEnable(eventTap, true);
+        atomic_store(&eventPipelineReady, CGEventTapIsEnabled(eventTap));
         fprintf(stderr, "[JomaaDrag] Đã tạo thành công CGEventTap!\n");
         return YES;
     }
@@ -1127,7 +1152,10 @@ static BOOL trySetupEventTap(void) {
 }
 
 static void detachAndResetTrackpad(void) {
-    stopDrag("Trackpad đổi cổng / ngắt kết nối");
+    pthread_mutex_lock(&mu);
+    acceptingTouches = 0;
+    pthread_mutex_unlock(&mu);
+    // Never hold mu while stopping the driver: it may wait for a callback.
     if (connectedDeviceRef) {
         if (MTUnregisterContactFrameCallback) {
             MTUnregisterContactFrameCallback(connectedDeviceRef, touchCallback);
@@ -1136,17 +1164,24 @@ static void detachAndResetTrackpad(void) {
             MTDeviceStop(connectedDeviceRef);
         }
     }
+    stopDrag("Trackpad đổi cổng / ngắt kết nối");
+    pthread_mutex_lock(&mu);
+    connectedDeviceRef = NULL;
+    pthread_mutex_unlock(&mu);
     if (deviceListRef) {
         CFRelease(deviceListRef);
         deviceListRef = NULL;
     }
-    connectedDeviceRef = NULL;
     attached = 0;
     connectedDeviceId = 0;
 }
 
 static void checkAndAttachTrackpad(void) {
-    if (!MTDeviceCreateList) return;
+    if (!multitouchAPIReady() || !atomic_load(&eventPipelineReady) ||
+        atomic_load(&stopRequested) || atomic_load(&engineSuspended)) {
+        if (attached) detachAndResetTrackpad();
+        return;
+    }
 
     CFArrayRef list = MTDeviceCreateList();
     if (!list) return;
@@ -1177,11 +1212,14 @@ static void checkAndAttachTrackpad(void) {
             }
         }
 
+        pthread_mutex_lock(&mu);
+        connectedDeviceRef = externalDev;
+        acceptingTouches = 1;
+        pthread_mutex_unlock(&mu);
         MTRegisterContactFrameCallback(externalDev, touchCallback);
         MTDeviceStart(externalDev, 0);
         attached = 1;
         connectedDeviceId = externalId;
-        connectedDeviceRef = externalDev;
         deviceListRef = list;
         fprintf(stderr, "[JomaaDrag] Đã kết nối trackpad ngoài: ID=%llu\n", (unsigned long long)externalId);
     } else {
@@ -1190,6 +1228,40 @@ static void checkAndAttachTrackpad(void) {
         }
         CFRelease(list);
     }
+}
+
+static void shutdownEngine(void) {
+    if (atomic_exchange(&stopRequested, 1)) return;
+    if (timer) {
+        CFRunLoopTimerInvalidate(timer);
+        CFRelease(timer);
+        timer = NULL;
+    }
+    // Finish gestures while the shared event source is still alive.
+    detachAndResetTrackpad();
+    atomic_store(&eventPipelineReady, 0);
+    if (eventTapSource) {
+        CFRunLoopSourceInvalidate(eventTapSource);
+        CFRelease(eventTapSource);
+        eventTapSource = NULL;
+    }
+    if (eventTap) {
+        CGEventTapEnable(eventTap, false);
+        CFMachPortInvalidate(eventTap);
+        CFRelease(eventTap);
+        eventTap = NULL;
+    }
+    pthread_mutex_lock(&mu);
+    if (hidEventSource) {
+        CFRelease(hidEventSource);
+        hidEventSource = NULL;
+    }
+    pthread_mutex_unlock(&mu);
+}
+
+static void requestTermination(int signo) {
+    (void)signo;
+    terminationRequested = 1;
 }
 
 // --- Menu Bar App Delegate ---
@@ -1216,8 +1288,6 @@ static void checkAndAttachTrackpad(void) {
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    tRef = nowMs();
-
     [self loadSensitivitySettings];
     atomic_store_explicit(&naturalScrollingSetting, readNaturalScrolling(), memory_order_relaxed);
 
@@ -1235,10 +1305,10 @@ static void checkAndAttachTrackpad(void) {
         MTDeviceIsBuiltIn = dlsym(h, "MTDeviceIsBuiltIn");
         MTDeviceIsAvailable = dlsym(h, "MTDeviceIsAvailable");
         MTDeviceIsRunning = dlsym(h, "MTDeviceIsRunning");
-        checkAndAttachTrackpad();
     }
 
     trySetupEventTap();
+    checkAndAttachTrackpad();
 
     timer = CFRunLoopTimerCreate(kCFAllocatorDefault,
         CFAbsoluteTimeGetCurrent() + 0.00833, 0.00833, 0, 0, tick, NULL);
@@ -1250,6 +1320,8 @@ static void checkAndAttachTrackpad(void) {
                                                            selector:@selector(onWakeFromSleep:)
                                                                name:NSWorkspaceDidWakeNotification
                                                              object:nil];
+    [[[NSWorkspace sharedWorkspace] notificationCenter] addObserver:self
+        selector:@selector(onWillSleep:) name:NSWorkspaceWillSleepNotification object:nil];
 
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                       target:self
@@ -1269,7 +1341,8 @@ static void checkAndAttachTrackpad(void) {
 
     self.syncWithSystemTrackpad = [defs boolForKey:@"SyncWithSystemTrackpad"];
     self.customSensitivity = [defs doubleForKey:@"CustomSensitivity"];
-    if (self.customSensitivity < 0.3) self.customSensitivity = 1.0;
+    if (!isfinite(self.customSensitivity) || self.customSensitivity < 0.3) self.customSensitivity = 1.0;
+    self.customSensitivity = fmin(self.customSensitivity, 2.5);
 
     [self applySensitivitySettings];
 }
@@ -1307,7 +1380,7 @@ static void checkAndAttachTrackpad(void) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v15 (Fast 3-Finger Drag)" action:nil keyEquivalent:@""];
+    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v15.1" action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
 
@@ -1426,6 +1499,7 @@ static void checkAndAttachTrackpad(void) {
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
         self.prefsWindow.title = @"Cài đặt Độ nhạy Trackpad (JomaaDrag)";
+        self.prefsWindow.releasedWhenClosed = NO;
         self.prefsWindow.delegate = self;
         [self.prefsWindow center];
 
@@ -1550,21 +1624,25 @@ static void checkAndAttachTrackpad(void) {
 }
 
 - (void)onWakeFromSleep:(NSNotification *)note {
+    (void)note;
     detachAndResetTrackpad();
+    atomic_store(&engineSuspended, 0);
+    trySetupEventTap();
     checkAndAttachTrackpad();
-    if (!eventTap) {
-        trySetupEventTap();
-    }
+}
+
+- (void)onWillSleep:(NSNotification *)note {
+    (void)note;
+    atomic_store(&engineSuspended, 1);
+    detachAndResetTrackpad();
 }
 
 - (void)onPollTimer {
-    if (!eventTap) {
-        if (trySetupEventTap()) {
-            if (self.statusMenuItem) {
-                self.statusMenuItem.title = @"Trạng thái: Hoạt động mượt mà 🟢";
-            }
-        }
-    }
+    if (atomic_load(&stopRequested) || atomic_load(&engineSuspended)) return;
+    BOOL ready = trySetupEventTap();
+    self.statusMenuItem.title = !multitouchAPIReady()
+        ? @"Trạng thái: Không thể tải driver cảm ứng ⚠️"
+        : (ready ? @"Trạng thái: Đang hoạt động 🟢" : @"Trạng thái: Cần cấp quyền Trợ năng ⚠️");
 
     checkAndAttachTrackpad();
     atomic_store_explicit(&naturalScrollingSetting, readNaturalScrolling(), memory_order_relaxed);
@@ -1590,25 +1668,22 @@ static void checkAndAttachTrackpad(void) {
 }
 
 - (void)quitApp {
-    stopRequested = 1;
-    stopDrag("Người dùng thoát ứng dụng");
-    if (timer) CFRelease(timer);
-    if (eventTapSource) CFRelease(eventTapSource);
-    if (eventTap) CFRelease(eventTap);
-    if (hidEventSource) CFRelease(hidEventSource);
-    detachAndResetTrackpad();
     [NSApp terminate:nil];
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
-    stopRequested = 1;
-    stopDrag("Ứng dụng kết thúc");
-    detachAndResetTrackpad();
+    (void)aNotification;
+    [self.pollTimer invalidate];
+    self.pollTimer = nil;
+    [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self];
+    shutdownEngine();
 }
 
 @end
 
-int main(int argc, const char * argv[]) {
+int main(void) {
+    signal(SIGTERM, requestTermination);
+    signal(SIGINT, requestTermination);
     @autoreleasepool {
         NSApplication *app = [NSApplication sharedApplication];
         AppDelegate *delegate = [[AppDelegate alloc] init];
