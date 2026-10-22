@@ -8,14 +8,19 @@
 
 ---
 
-## Current release: 15.2
+## Current release: 15.2.1
+
+Version 15.2.1 fixes staggered four-finger recognition and reads your actual
+macOS Mission Control keyboard shortcuts, including custom mappings. The menu
+shows how many fingers the sensor has detected and warns when shortcuts are
+missing. See [CHANGES-15.2.1.md](CHANGES-15.2.1.md).
 
 Version 15.2 adds touch-to-stop momentum, a momentum toggle, pause/resume and
 optional four-finger Mission Control/App Exposé/desktop gestures. Open the menu
 bar icon → **Cử chỉ Trackpad** to configure them. Four-finger gestures default
-to disabled and use the standard macOS Control-arrow shortcuts.
+to disabled and use the configured macOS Mission Control shortcuts.
 
-Run `make test` for 19 gesture/lifecycle regression scenarios, and `make build`
+Run `make test` for 21 gesture/lifecycle regression scenarios, and `make build`
 to build without installing. See [CHANGES-15.2.md](CHANGES-15.2.md) for defaults,
 compatibility details and [the REA inspection](docs/REA-AUDIT.md).
 

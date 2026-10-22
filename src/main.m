@@ -148,6 +148,62 @@ static int fourFingerGesturesEnabled = 0;
 static int fourFingerClaimed = 0;
 static int fourFingerFired = 0;
 static double fourFingerDx = 0.0, fourFingerDy = 0.0;
+static _Atomic int maximumFingerCount = 0;
+
+typedef struct {
+    CGKeyCode key;
+    CGEventFlags flags;
+    int enabled;
+} WorkspaceShortcut;
+// Right/left/up/down fingers -> previous/next desktop/Mission Control/App Exposé.
+static WorkspaceShortcut workspaceShortcuts[4] = {
+    {123, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1},
+    {124, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1},
+    {126, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1},
+    {125, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1}
+};
+
+static WorkspaceShortcut parseWorkspaceShortcut(NSDictionary *settings, NSString *identifier,
+                                                 CGKeyCode defaultKey) {
+    WorkspaceShortcut shortcut = {defaultKey, kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1};
+    id entry = settings[identifier];
+    if (!entry) return shortcut; // Absent entries use macOS defaults.
+    if (![entry isKindOfClass:[NSDictionary class]]) { shortcut.enabled = 0; return shortcut; }
+    id enabled = entry[@"enabled"];
+    if ([enabled respondsToSelector:@selector(boolValue)] && ![enabled boolValue]) shortcut.enabled = 0;
+    id value = entry[@"value"];
+    if (!value) return shortcut;
+    if (![value isKindOfClass:[NSDictionary class]]) { shortcut.enabled = 0; return shortcut; }
+    id parameters = value[@"parameters"];
+    if (![parameters isKindOfClass:[NSArray class]] || [parameters count] != 3 ||
+        ![parameters[1] isKindOfClass:[NSNumber class]] || ![parameters[2] isKindOfClass:[NSNumber class]]) {
+        shortcut.enabled = 0;
+        return shortcut;
+    }
+    double rawKey = [parameters[1] doubleValue];
+    NSInteger key = [parameters[1] integerValue];
+    if (!isfinite(rawKey) || rawKey != key || key < 0 || key > 127 ||
+        (key == 0 && [parameters[0] isEqual:@65535])) {
+        shortcut.enabled = 0;
+        return shortcut;
+    }
+    shortcut.key = (CGKeyCode)key;
+    shortcut.flags = [parameters[2] unsignedLongLongValue];
+    return shortcut;
+}
+
+static void refreshWorkspaceShortcuts(void) {
+    CFPreferencesAppSynchronize(CFSTR("com.apple.symbolichotkeys"));
+    CFPropertyListRef settings = CFPreferencesCopyAppValue(CFSTR("AppleSymbolicHotKeys"), CFSTR("com.apple.symbolichotkeys"));
+    NSDictionary *dictionary = settings && CFGetTypeID(settings) == CFDictionaryGetTypeID()
+        ? (__bridge NSDictionary *)settings : @{};
+    NSArray<NSString *> *identifiers = @[@"79", @"81", @"32", @"33"];
+    const CGKeyCode defaultKeys[4] = {123, 124, 126, 125};
+    pthread_mutex_lock(&mu);
+    for (int i = 0; i < 4; i++) workspaceShortcuts[i] = parseWorkspaceShortcut(dictionary, identifiers[i], defaultKeys[i]);
+    pthread_mutex_unlock(&mu);
+    if (settings) CFRelease(settings);
+}
 
 static void resetFourFingerGesture(void) {
     fourFingerClaimed = fourFingerFired = 0;
@@ -374,6 +430,7 @@ static void postDragMouseEvent(CGEventType type, CGPoint p, double dx, double dy
 // Trạng thái khởi động kéo 3 ngón
 static double dragArmDx = 0.0;
 static double dragArmDy = 0.0;
+static double dragArmSinceT = 0.0;
 static int dragArmed = 0;
 
 static CFMachPortRef eventTap = NULL;
@@ -572,6 +629,7 @@ static int computeTwoFingerKinematics(const TouchPos *curr, int currN,
 static void releaseDragAndUnlockCursorLocked(void) {
     dragArmed = 0;
     dragArmDx = dragArmDy = 0.0;
+    dragArmSinceT = 0.0;
     dragTargetDx = dragTargetDy = 0.0;
     singleFingerSinceT = 0.0;
     atomic_store_explicit(&dragging, 0, memory_order_relaxed);
@@ -596,23 +654,30 @@ static void finishDragLocked(int flushPendingMovement) {
 
 // Use the standard macOS Control-arrow shortcuts; allocate both before posting
 // so allocation failure cannot leave a synthetic key held down.
-static void emitWorkspaceShortcut(CGKeyCode key) {
-    CGEventRef down = CGEventCreateKeyboardEvent(sharedHIDSource(), key, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(sharedHIDSource(), key, false);
+static int emitWorkspaceShortcut(int direction) {
+    WorkspaceShortcut shortcut = workspaceShortcuts[direction];
+    if (!shortcut.enabled) {
+        fprintf(stderr, "[JomaaDrag] 4-finger: phím tắt macOS hướng %d đang tắt/chưa gán.\n", direction);
+        return 0;
+    }
+    CGEventRef down = CGEventCreateKeyboardEvent(sharedHIDSource(), shortcut.key, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(sharedHIDSource(), shortcut.key, false);
+    int posted = 0;
     if (down && up) {
-        CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
-        flags &= ~(kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate |
-                   kCGEventFlagMaskShift | kCGEventFlagMaskSecondaryFn);
-        flags |= kCGEventFlagMaskControl;
-        CGEventSetFlags(down, flags);
-        CGEventSetFlags(up, flags);
+        // Preserve configured arrow/Fn flags and custom modifiers exactly.
+        CGEventSetFlags(down, shortcut.flags);
+        CGEventSetFlags(up, shortcut.flags);
         CGEventSetIntegerValueField(down, kCGEventSourceUserData, MAGIC);
         CGEventSetIntegerValueField(up, kCGEventSourceUserData, MAGIC);
-        CGEventPost(kCGSessionEventTap, down);
-        CGEventPost(kCGSessionEventTap, up);
+        CGEventPost(kCGHIDEventTap, down);
+        CGEventPost(kCGHIDEventTap, up);
+        posted = 1;
+        fprintf(stderr, "[JomaaDrag] 4-finger: gửi hướng %d, key=%u, flags=0x%llx.\n",
+            direction, shortcut.key, (unsigned long long)shortcut.flags);
     }
     if (down) CFRelease(down);
     if (up) CFRelease(up);
+    return posted;
 }
 
 // A claimed four-finger gesture owns its trailing 3/2/1 contacts until lift.
@@ -622,11 +687,13 @@ static int handleFourFingerGesture(const TouchPos *touches, int count, double tn
     if (!fourFingerClaimed && count != 4) return 0;
     if (!fourFingerClaimed) {
         fourFingerClaimed = 1;
+        fprintf(stderr, "[JomaaDrag] 4-finger: nhận đủ 4 ngón.\n");
         stopMosScrollImmediately(1);
         stopZoomImmediately(1);
         twoFingerMode = 0;
         dragArmed = 0;
         dragArmDx = dragArmDy = 0.0;
+        dragArmSinceT = 0.0;
     } else if (count == 4 && prevCount == 4 && !fourFingerFired) {
         double dx = 0.0, dy = 0.0;
         if (computeMatchedFingerDelta(touches, count, prevTouches, prevCount, &dx, &dy) == 4) {
@@ -635,10 +702,10 @@ static int handleFourFingerGesture(const TouchPos *touches, int count, double tn
             double ax = fabs(fourFingerDx), ay = fabs(fourFingerDy);
             // Require deliberate movement on one axis; do not repeat while held.
             if (ax >= 0.055 && ax > ay * 1.4) {
-                emitWorkspaceShortcut(fourFingerDx > 0.0 ? 123 : 124);
+                emitWorkspaceShortcut(fourFingerDx > 0.0 ? 0 : 1);
                 fourFingerFired = 1;
             } else if (ay >= 0.055 && ay > ax * 1.4) {
-                emitWorkspaceShortcut(fourFingerDy > 0.0 ? 126 : 125);
+                emitWorkspaceShortcut(fourFingerDy > 0.0 ? 2 : 3);
                 fourFingerFired = 1;
             }
         } else {
@@ -685,6 +752,10 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
         }
     }
     latestPresent = currCount;
+    if (currCount > atomic_load(&maximumFingerCount)) {
+        atomic_store(&maximumFingerCount, currCount);
+        fprintf(stderr, "[JomaaDrag] Cảm ứng: đã nhận tối đa %d ngón.\n", currCount);
+    }
 
     if (currCount > 0) {
         lastTouchT = tn;
@@ -741,12 +812,16 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
             if (!dragArmed || currCount != prevCount || matched != currCount) {
                 dragArmDx = dragArmDy = 0.0;
                 dragArmed = 1;
+                dragArmSinceT = tn;
             } else {
                 dragArmDx += matchedDx;
                 dragArmDy += matchedDy;
                 double dist = hypot(dragArmDx, dragArmDy) * SPEED_FACTOR;
 
-                if (dist >= 1.0) {
+                // Let staggered finger landings settle before committing to a
+                // drag. The original immediate drag stays unchanged when the
+                // optional four-finger recognizer is disabled.
+                if (dist >= 1.0 && (!fourFingerGesturesEnabled || tn - dragArmSinceT >= 60.0)) {
                     stopMosScrollImmediately(1);
                     stopZoomImmediately(1);
                     twoFingerMode = 0;
@@ -770,6 +845,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
         } else {
             dragArmed = 0;
             dragArmDx = dragArmDy = 0.0;
+            dragArmSinceT = 0.0;
         }
 
         // --- 2. BỘ ĐỊNH TUYẾN ĐỘNG HỌC 2 NGÓN 120Hz: CUỘN MƯỢT 2 CHIỀU vs PINCH-TO-ZOOM ---
@@ -1375,6 +1451,7 @@ static void setUserPaused(int paused) {
 @property (strong, nonatomic) NSMenu *sensitivitySubmenu;
 @property (strong, nonatomic) NSMenu *gestureSubmenu;
 @property (strong, nonatomic) NSMenuItem *pauseMenuItem;
+@property (strong, nonatomic) NSMenuItem *touchDiagnosticMenuItem;
 @property (strong, nonatomic) NSTimer *pollTimer;
 
 @property (assign, nonatomic) BOOL syncWithSystemTrackpad;
@@ -1399,6 +1476,7 @@ static void setUserPaused(int paused) {
     inertiaEnabled = [defaults boolForKey:@"ScrollInertiaEnabled"];
     fourFingerGesturesEnabled = [defaults boolForKey:@"FourFingerGesturesEnabled"];
     pthread_mutex_unlock(&mu);
+    refreshWorkspaceShortcuts();
     atomic_store_explicit(&naturalScrollingSetting, readNaturalScrolling(), memory_order_relaxed);
 
     void *h = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW);
@@ -1490,7 +1568,7 @@ static void setUserPaused(int paused) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"15.2";
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"15.2.1";
     NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:[@"JomaaDrag v" stringByAppendingString:version] action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
@@ -1506,6 +1584,9 @@ static void setUserPaused(int paused) {
         @"Trackpad: Đang chờ cắm thiết bị..." action:nil keyEquivalent:@""];
     [self.deviceMenuItem setEnabled:NO];
     [menu addItem:self.deviceMenuItem];
+    self.touchDiagnosticMenuItem = [[NSMenuItem alloc] initWithTitle:@"Cảm ứng: chưa ghi nhận ngón tay" action:nil keyEquivalent:@""];
+    self.touchDiagnosticMenuItem.enabled = NO;
+    [menu addItem:self.touchDiagnosticMenuItem];
 
     [menu addItem:[NSMenuItem separatorItem]];
 
@@ -1559,9 +1640,12 @@ static void setUserPaused(int paused) {
     NSMenuItem *hint = [[NSMenuItem alloc] initWithTitle:@"4 ngón: ↑ Mission Control · ↓ cửa sổ app · ↔ desktop" action:nil keyEquivalent:@""];
     hint.enabled = NO;
     [self.gestureSubmenu addItem:hint];
-    NSMenuItem *shortcutHint = [[NSMenuItem alloc] initWithTitle:@"Dùng phím tắt macOS mặc định Control + mũi tên" action:nil keyEquivalent:@""];
+    NSMenuItem *shortcutHint = [[NSMenuItem alloc] initWithTitle:@"Dùng phím tắt Mission Control đã cài trong macOS" action:nil keyEquivalent:@""];
     shortcutHint.enabled = NO;
     [self.gestureSubmenu addItem:shortcutHint];
+    NSMenuItem *keyboardSettings = [[NSMenuItem alloc] initWithTitle:@"Mở cài đặt phím tắt Mission Control…" action:@selector(openKeyboardShortcuts) keyEquivalent:@""];
+    keyboardSettings.target = self;
+    [self.gestureSubmenu addItem:keyboardSettings];
     self.pauseMenuItem.title = atomic_load(&userPaused) ? @"Tiếp tục JomaaDrag" : @"Tạm dừng JomaaDrag";
 }
 
@@ -1577,6 +1661,7 @@ static void setUserPaused(int paused) {
         resetFourFingerGesture();
         dragArmed = 0;
         dragArmDx = dragArmDy = 0.0;
+        dragArmSinceT = 0.0;
     }
     pthread_mutex_unlock(&mu);
     [[NSUserDefaults standardUserDefaults] setBool:value forKey:
@@ -1813,6 +1898,14 @@ static void setUserPaused(int paused) {
         : (ready ? @"Trạng thái: Đang hoạt động 🟢" : @"Trạng thái: Cần cấp quyền Trợ năng ⚠️");
 
     checkAndAttachTrackpad();
+    refreshWorkspaceShortcuts();
+    int maximum = atomic_load(&maximumFingerCount);
+    pthread_mutex_lock(&mu);
+    BOOL missingShortcut = !workspaceShortcuts[0].enabled || !workspaceShortcuts[1].enabled ||
+                          !workspaceShortcuts[2].enabled || !workspaceShortcuts[3].enabled;
+    pthread_mutex_unlock(&mu);
+    self.touchDiagnosticMenuItem.title = [NSString stringWithFormat:@"Cảm ứng: tối đa %d ngón%@", maximum,
+        missingShortcut ? @" · Phím tắt Mission Control chưa đủ" : @""];
     atomic_store_explicit(&naturalScrollingSetting, readNaturalScrolling(), memory_order_relaxed);
 
     if (self.syncWithSystemTrackpad) {
@@ -1833,6 +1926,10 @@ static void setUserPaused(int paused) {
 
 - (void)openAccessibility {
     [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]];
+}
+
+- (void)openKeyboardShortcuts {
+    [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.keyboard?Shortcuts"]];
 }
 
 - (void)quitApp {

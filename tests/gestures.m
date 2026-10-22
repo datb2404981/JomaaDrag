@@ -39,6 +39,7 @@ typedef struct {
     int64_t key;
     CGEventFlags flags;
     int64_t x, y;
+    CGEventTapLocation location;
 } RecordedEvent;
 static RecordedEvent events[8192];
 static size_t eventCount;
@@ -57,7 +58,8 @@ static void recordEvent(CGEventTapLocation location, CGEventRef event) {
         CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode),
         CGEventGetFlags(event),
         CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2),
-        CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1)
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1),
+        location
     };
 }
 
@@ -92,6 +94,10 @@ static void resetFixture(void) {
     inertiaEnabled = 1;
     fourFingerGesturesEnabled = 0;
     heldFlags = 0;
+    for (int i = 0; i < 4; i++) {
+        const CGKeyCode keys[4] = {123, 124, 126, 125};
+        workspaceShortcuts[i] = (WorkspaceShortcut){keys[i], kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn, 1};
+    }
     terminationRequested = 0;
     acceptingTouches = 1;
     connectedDeviceRef = fakeDevice;
@@ -418,7 +424,8 @@ static void testFourFingerDirectionsAndOneShot(void) {
         assert(eventCount == 2 && !atomic_load(&dragging));
         assert(events[0].type == kCGEventKeyDown && events[1].type == kCGEventKeyUp);
         assert(events[0].key == keys[direction] && events[1].key == keys[direction]);
-        assert(events[0].flags == kCGEventFlagMaskControl);
+        assert(events[0].flags == (kCGEventFlagMaskControl | kCGEventFlagMaskSecondaryFn));
+        assert(events[0].location == kCGHIDEventTap && events[1].location == kCGHIDEventTap);
         sendTouches(touches, 4, 1020.0);
         sendTouches(touches, 3, 1030.0);
         for (int i = 0; i < 3; i++) touches[i].normalized.pos.x += 0.002;
@@ -466,9 +473,13 @@ static void testFourFingerPreservesDragAndDefault(void) {
     verifyMouseOrder();
     resetFixture();
     fourFingerGesturesEnabled = 1;
-    startDrag(touches);
+    makeTouches(touches, 3, 0);
+    sendTouches(touches, 3, 1000.0);
+    makeTouches(touches, 3, 0.001);
+    sendTouches(touches, 3, 1070.0);
+    assert(atomic_load(&dragging));
     makeTouches(touches, 4, 0.001);
-    sendTouches(touches, 4, 1020.0);
+    sendTouches(touches, 4, 1080.0);
     assert(atomic_load(&dragging) && !fourFingerClaimed);
     stopDrag("fourth finger must not steal existing drag");
     verifyMouseOrder();
@@ -531,6 +542,58 @@ static void testExistingScrollZoomAndMousePassthrough(void) {
     assert(zoomPhaseState == 0);
 }
 
+static void testStaggeredFourFingerLandingDoesNotStartDrag(void) {
+    resetFixture();
+    fourFingerGesturesEnabled = 1;
+    MTTouch touches[4];
+    makeTouches(touches, 3, 0);
+    sendTouches(touches, 3, 1000.0);
+    makeTouches(touches, 3, 0.002);
+    sendTouches(touches, 3, 1010.0);
+    assert(!atomic_load(&dragging) && eventCount == 0);
+    makeTouches(touches, 4, 0.002);
+    sendTouches(touches, 4, 1020.0);
+    makeTouches(touches, 4, 0.062);
+    sendTouches(touches, 4, 1030.0);
+    assert(fourFingerFired && !atomic_load(&dragging));
+    assert(eventCount == 2 && events[0].type == kCGEventKeyDown);
+    sendTouches(NULL, 0, 1040.0);
+    assert(!dragArmed && !fourFingerClaimed);
+}
+
+static void testConfiguredWorkspaceShortcuts(void) {
+    resetFixture();
+    // These include the Fn flag present in the user's actual macOS mappings.
+    NSDictionary *settings = @{
+        @"32": @{@"enabled": @YES, @"value": @{@"parameters": @[@65535, @126, @8650752]}},
+        @"79": @{@"enabled": @NO, @"value": @{@"parameters": @[@65535, @123, @8650752]}},
+        @"81": @{@"enabled": @YES, @"value": @{@"parameters": @[@65535, @20, @1179648]}}
+    };
+    WorkspaceShortcut up = parseWorkspaceShortcut(settings, @"32", 126);
+    assert(up.enabled && up.key == 126 && up.flags == 8650752);
+    WorkspaceShortcut left = parseWorkspaceShortcut(settings, @"79", 123);
+    assert(!left.enabled);
+    WorkspaceShortcut right = parseWorkspaceShortcut(settings, @"81", 124);
+    assert(right.enabled && right.key == 20 && right.flags == 1179648);
+    WorkspaceShortcut defaults = parseWorkspaceShortcut(settings, @"33", 125);
+    assert(defaults.enabled && defaults.key == 125 && defaults.flags == 8650752);
+    pthread_mutex_lock(&mu);
+    workspaceShortcuts[0] = left;
+    workspaceShortcuts[1] = right;
+    assert(!emitWorkspaceShortcut(0) && eventCount == 0);
+    assert(emitWorkspaceShortcut(1) && eventCount == 2);
+    pthread_mutex_unlock(&mu);
+    assert(events[0].key == 20 && events[1].key == 20);
+    assert(events[0].flags == 1179648 && events[1].flags == 1179648);
+    NSDictionary *malformed[] = {
+        @{@"32": @"invalid"},
+        @{@"32": @{@"value": @"invalid"}},
+        @{@"32": @{@"value": @{@"parameters": @[@1, @2]}}},
+        @{@"32": @{@"value": @{@"parameters": @[@65535, @65535, @0]}}}
+    };
+    for (int i = 0; i < 4; i++) assert(!parseWorkspaceShortcut(malformed[i], @"32", 126).enabled);
+}
+
 int main(void) {
     @autoreleasepool {
         testFingerReplacementAndDropout();
@@ -551,8 +614,10 @@ int main(void) {
         testFourFingerPreservesDragAndDefault();
         testPauseClosesGesturesAndPassesPhysicalInput();
         testExistingScrollZoomAndMousePassthrough();
+        testStaggeredFourFingerLandingDoesNotStartDrag();
+        testConfiguredWorkspaceShortcuts();
         testIdempotentShutdown();
-        puts("PASS: 19 gesture/lifecycle regression scenarios (no system input injected)");
+        puts("PASS: 21 gesture/lifecycle regression scenarios (no system input injected)");
     }
     return 0;
 }
