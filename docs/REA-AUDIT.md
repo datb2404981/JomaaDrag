@@ -46,3 +46,26 @@ No Hopper/Ghidra decompilation or physical sensor replay was performed. REA's
 artifact checks establish packaging facts; the regression suite establishes
 behavior for simulated frames. Neither proves identical hardware feel to an
 Apple trackpad, Force Touch, haptic feedback or interactive Spaces animations.
+
+## Installed 15.2 verification
+
+After the 19 scenarios and signed build passed, the original bundle was backed
+up outside the source checkout as `backups/JomaaDrag-15.1.app`. Its executable
+retains the 15.1 digest recorded above.
+
+Version 15.2 was installed at the existing application path. The built and
+installed executables match SHA-256
+`8fc8f8e134164837075b5b0b91fcbf8ea5c4a5e93b25f21ddf9c0eb0aa42fa81`.
+`codesign --verify --deep --strict` and plist validation passed.
+
+REA independently observed version 15.2, the same bundle identifier and the
+same designated signing requirement. The local evidence IDs are:
+
+- Plist: `ev_9989a53d695c8ab7f8a01e154d1e0762a60547e013909494de20ac65b358d37c`
+- Signature: `ev_17187876232b3b48bc3ff7c025d66ea7fda58cb203865d2e30d31ec909302f23`
+
+The existing LaunchAgent was observed running the installed executable with
+one launch and no exit. New log entries confirmed event-tap creation and external
+trackpad attachment. The native UI automation bridge timed out selecting this
+menu bar app, so menu interaction and physical gesture feel were not verified
+through UI automation.
