@@ -83,6 +83,7 @@ static _Atomic int dragging = 0;
 static _Atomic int stopRequested = 0;
 static _Atomic int eventPipelineReady = 0;
 static _Atomic int engineSuspended = 0;
+static _Atomic int userPaused = 0;
 static volatile sig_atomic_t terminationRequested = 0;
 // Protected by mu. Close this gate before unregistering/stopping a device.
 static int acceptingTouches = 0;
@@ -115,6 +116,7 @@ static int prevCount = 0;
 // ============================================================================
 static double lastScrollFrameT = 0.0;
 static double lastTwoFingerT = 0.0;
+static double lastScrollMotionT = 0.0;
 
 static double mosTargetBufferX = 0.0;
 static double mosTargetBufferY = 0.0;
@@ -139,6 +141,18 @@ static int zoomPhaseState = 0;
 static double zoomTargetBuffer = 0.0;
 static int pinchStreak = 0;
 static int scrollStreak = 0;
+
+// Gesture options and recognizer state are protected by mu.
+static int inertiaEnabled = 1;
+static int fourFingerGesturesEnabled = 0;
+static int fourFingerClaimed = 0;
+static int fourFingerFired = 0;
+static double fourFingerDx = 0.0, fourFingerDy = 0.0;
+
+static void resetFourFingerGesture(void) {
+    fourFingerClaimed = fourFingerFired = 0;
+    fourFingerDx = fourFingerDy = 0.0;
+}
 
 static inline double nowMs(void) {
     struct timespec ts;
@@ -408,6 +422,8 @@ static CGEventRef mouseEventTap(CGEventTapProxy proxy, CGEventType type,
 
     int64_t userData = CGEventGetIntegerValueField(event, kCGEventSourceUserData);
     if (userData == MAGIC || userData == MOS_PASS_MAGIC) return event;
+    if (atomic_load(&userPaused) || atomic_load(&engineSuspended) ||
+        atomic_load(&stopRequested) || !atomic_load(&eventPipelineReady)) return event;
 
     double now = nowMs();
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
@@ -578,6 +594,65 @@ static void finishDragLocked(int flushPendingMovement) {
     }
 }
 
+// Use the standard macOS Control-arrow shortcuts; allocate both before posting
+// so allocation failure cannot leave a synthetic key held down.
+static void emitWorkspaceShortcut(CGKeyCode key) {
+    CGEventRef down = CGEventCreateKeyboardEvent(sharedHIDSource(), key, true);
+    CGEventRef up = CGEventCreateKeyboardEvent(sharedHIDSource(), key, false);
+    if (down && up) {
+        CGEventFlags flags = CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState);
+        flags &= ~(kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate |
+                   kCGEventFlagMaskShift | kCGEventFlagMaskSecondaryFn);
+        flags |= kCGEventFlagMaskControl;
+        CGEventSetFlags(down, flags);
+        CGEventSetFlags(up, flags);
+        CGEventSetIntegerValueField(down, kCGEventSourceUserData, MAGIC);
+        CGEventSetIntegerValueField(up, kCGEventSourceUserData, MAGIC);
+        CGEventPost(kCGSessionEventTap, down);
+        CGEventPost(kCGSessionEventTap, up);
+    }
+    if (down) CFRelease(down);
+    if (up) CFRelease(up);
+}
+
+// A claimed four-finger gesture owns its trailing 3/2/1 contacts until lift.
+// Adding a fourth finger to an established drag never steals that drag.
+static int handleFourFingerGesture(const TouchPos *touches, int count, double tn) {
+    if (!fourFingerGesturesEnabled || atomic_load(&dragging)) return 0;
+    if (!fourFingerClaimed && count != 4) return 0;
+    if (!fourFingerClaimed) {
+        fourFingerClaimed = 1;
+        stopMosScrollImmediately(1);
+        stopZoomImmediately(1);
+        twoFingerMode = 0;
+        dragArmed = 0;
+        dragArmDx = dragArmDy = 0.0;
+    } else if (count == 4 && prevCount == 4 && !fourFingerFired) {
+        double dx = 0.0, dy = 0.0;
+        if (computeMatchedFingerDelta(touches, count, prevTouches, prevCount, &dx, &dy) == 4) {
+            fourFingerDx += dx;
+            fourFingerDy += dy;
+            double ax = fabs(fourFingerDx), ay = fabs(fourFingerDy);
+            // Require deliberate movement on one axis; do not repeat while held.
+            if (ax >= 0.055 && ax > ay * 1.4) {
+                emitWorkspaceShortcut(fourFingerDx > 0.0 ? 123 : 124);
+                fourFingerFired = 1;
+            } else if (ay >= 0.055 && ay > ax * 1.4) {
+                emitWorkspaceShortcut(fourFingerDy > 0.0 ? 126 : 125);
+                fourFingerFired = 1;
+            }
+        } else {
+            fourFingerDx = fourFingerDy = 0.0;
+        }
+    } else if (!fourFingerFired) {
+        fourFingerDx = fourFingerDy = 0.0;
+    }
+    atomic_store(&multiTouchActive, count > 0);
+    if (count > 0) atomic_store(&lastMultiTouchT, tn);
+    if (count == 0) resetFourFingerGesture();
+    return 1;
+}
+
 static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame) {
     (void)d; (void)ts; (void)frame;
     double tn = nowMs();
@@ -585,7 +660,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     pthread_mutex_lock(&mu);
     // The private callback's device token is not stable across framework versions.
     // Detach closes this gate and drains the old driver before reattaching.
-    if (!acceptingTouches || atomic_load(&stopRequested) || atomic_load(&engineSuspended) ||
+    if (!acceptingTouches || atomic_load(&stopRequested) || atomic_load(&engineSuspended) || atomic_load(&userPaused) ||
         !atomic_load(&eventPipelineReady) || n < 0 || (n > 0 && !t)) {
         pthread_mutex_unlock(&mu);
         return 0;
@@ -614,6 +689,18 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     if (currCount > 0) {
         lastTouchT = tn;
         atomic_store_explicit(&lastAnyJomaaTouchT, tn, memory_order_relaxed);
+    }
+
+    // A contact brakes momentum immediately, including one stationary
+    // finger. An all-up frame must never brake an existing fling.
+    if (currCount > 0 && mosPhaseState == 2) {
+        stopMosScrollImmediately(0);
+    }
+    if (handleFourFingerGesture(currTouches, currCount, tn)) {
+        prevCount = currCount;
+        for (int i = 0; i < currCount; i++) prevTouches[i] = currTouches[i];
+        pthread_mutex_unlock(&mu);
+        return 0;
     }
 
     int isDragging = atomic_load_explicit(&dragging, memory_order_relaxed);
@@ -809,6 +896,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
                     }
                 } else if (twoFingerMode != 2 && panMag > 0.00003) {
                     // --- NHÁNH 2B: NỘI SUY 120Hz CUỘN 2 CHIỀU (NGANG & DỌC + OPTION DASH) ---
+                    lastScrollMotionT = tn;
                     int dashActive = isOptionDashActive();
                     if (dashActive) mosDashMomentum = 1;
                     double dashBoost = dashActive ? 3.2 : 1.0;
@@ -929,8 +1017,9 @@ static void stopDrag(const char *why) {
     stopMosScrollImmediately(1);
     stopZoomImmediately(1);
     twoFingerMode = 0;
+    resetFourFingerGesture();
     latestPresent = 0;
-    lastTouchT = lastDragContactT = lastTwoFingerT = lastScrollFrameT = 0.0;
+    lastTouchT = lastDragContactT = lastTwoFingerT = lastScrollFrameT = lastScrollMotionT = 0.0;
     atomic_store(&lastMultiTouchT, 0.0);
     atomic_store(&lastAnyJomaaTouchT, 0.0);
     finishDragLocked(0);
@@ -947,7 +1036,7 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         [NSApp terminate:nil];
         return;
     }
-    if (atomic_load(&stopRequested) || atomic_load(&engineSuspended)) {
+    if (atomic_load(&stopRequested) || atomic_load(&engineSuspended) || atomic_load(&userPaused)) {
         return;
     }
 
@@ -959,6 +1048,13 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
     double touchGap = tn - lastTouchT;
     double twoFingerGap = tn - lastTwoFingerT;
     double dragContactGap = tn - lastDragContactT;
+
+    // Recover a missing release frame without reclassifying trailing contacts.
+    if (fourFingerClaimed && touchGap >= 380.0) {
+        resetFourFingerGesture();
+        prevCount = latestPresent = 0;
+        atomic_store(&multiTouchActive, 0);
+    }
 
     // 1. Khi người dùng đang KÉO 3 NGÓN:
     if (isDragging) {
@@ -1020,7 +1116,8 @@ static void tick(CFRunLoopTimerRef timerRef, void *info) {
         }
         double maxLaunchVel = mosDashMomentum ? 125.0 : 42.0;
 
-        if (hypot(launchVelX, launchVelY) >= 1.2) {
+        if (tn - lastScrollMotionT > 100.0) launchVelX = launchVelY = 0.0;
+        if (inertiaEnabled && hypot(launchVelX, launchVelY) >= 1.2) {
             mosVelocityPerTickX = fmin(fmax(launchVelX, -maxLaunchVel), maxLaunchVel);
             mosVelocityPerTickY = fmin(fmax(launchVelY, -maxLaunchVel), maxLaunchVel);
             mosPhaseState = 2;
@@ -1178,7 +1275,7 @@ static void detachAndResetTrackpad(void) {
 
 static void checkAndAttachTrackpad(void) {
     if (!multitouchAPIReady() || !atomic_load(&eventPipelineReady) ||
-        atomic_load(&stopRequested) || atomic_load(&engineSuspended)) {
+        atomic_load(&stopRequested) || atomic_load(&engineSuspended) || atomic_load(&userPaused)) {
         if (attached) detachAndResetTrackpad();
         return;
     }
@@ -1264,6 +1361,11 @@ static void requestTermination(int signo) {
     terminationRequested = 1;
 }
 
+static void setUserPaused(int paused) {
+    atomic_store(&userPaused, paused);
+    if (paused) detachAndResetTrackpad();
+}
+
 // --- Menu Bar App Delegate ---
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property (strong, nonatomic) NSStatusItem *statusItem;
@@ -1271,6 +1373,8 @@ static void requestTermination(int signo) {
 @property (strong, nonatomic) NSMenuItem *deviceMenuItem;
 @property (strong, nonatomic) NSMenuItem *sensitivityMenuItem;
 @property (strong, nonatomic) NSMenu *sensitivitySubmenu;
+@property (strong, nonatomic) NSMenu *gestureSubmenu;
+@property (strong, nonatomic) NSMenuItem *pauseMenuItem;
 @property (strong, nonatomic) NSTimer *pollTimer;
 
 @property (assign, nonatomic) BOOL syncWithSystemTrackpad;
@@ -1289,6 +1393,12 @@ static void requestTermination(int signo) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     [self loadSensitivitySettings];
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults registerDefaults:@{@"ScrollInertiaEnabled": @YES, @"FourFingerGesturesEnabled": @NO}];
+    pthread_mutex_lock(&mu);
+    inertiaEnabled = [defaults boolForKey:@"ScrollInertiaEnabled"];
+    fourFingerGesturesEnabled = [defaults boolForKey:@"FourFingerGesturesEnabled"];
+    pthread_mutex_unlock(&mu);
     atomic_store_explicit(&naturalScrollingSetting, readNaturalScrolling(), memory_order_relaxed);
 
     void *h = dlopen("/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport", RTLD_NOW);
@@ -1380,7 +1490,8 @@ static void requestTermination(int signo) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:@"JomaaDrag v15.1" action:nil keyEquivalent:@""];
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"15.2";
+    NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:[@"JomaaDrag v" stringByAppendingString:version] action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
 
@@ -1403,6 +1514,14 @@ static void requestTermination(int signo) {
     [self.sensitivityMenuItem setSubmenu:self.sensitivitySubmenu];
     [menu addItem:self.sensitivityMenuItem];
 
+    NSMenuItem *gestures = [[NSMenuItem alloc] initWithTitle:@"Cử chỉ Trackpad" action:nil keyEquivalent:@""];
+    self.gestureSubmenu = [[NSMenu alloc] init];
+    gestures.submenu = self.gestureSubmenu;
+    [menu addItem:gestures];
+    self.pauseMenuItem = [[NSMenuItem alloc] initWithTitle:@"Tạm dừng JomaaDrag" action:@selector(togglePause:) keyEquivalent:@""];
+    self.pauseMenuItem.target = self;
+    [menu addItem:self.pauseMenuItem];
+
     [menu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *loginItem = [[NSMenuItem alloc] initWithTitle:@"Khởi động cùng máy: Đã bật ✅" action:nil keyEquivalent:@""];
@@ -1421,6 +1540,55 @@ static void requestTermination(int signo) {
 
     self.statusItem.menu = menu;
     [self updateSensitivityMenuUI];
+    [self updateGestureMenuUI];
+}
+
+- (void)updateGestureMenuUI {
+    pthread_mutex_lock(&mu);
+    int inertia = inertiaEnabled, fourFingers = fourFingerGesturesEnabled;
+    pthread_mutex_unlock(&mu);
+    [self.gestureSubmenu removeAllItems];
+    NSArray<NSString *> *titles = @[@"Cuộn có quán tính", @"Vuốt 4 ngón: Mission Control / Desktop"];
+    for (NSInteger i = 0; i < 2; i++) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:titles[i] action:@selector(toggleGestureOption:) keyEquivalent:@""];
+        item.target = self;
+        item.tag = i;
+        item.state = (i == 0 ? inertia : fourFingers) ? NSControlStateValueOn : NSControlStateValueOff;
+        [self.gestureSubmenu addItem:item];
+    }
+    NSMenuItem *hint = [[NSMenuItem alloc] initWithTitle:@"4 ngón: ↑ Mission Control · ↓ cửa sổ app · ↔ desktop" action:nil keyEquivalent:@""];
+    hint.enabled = NO;
+    [self.gestureSubmenu addItem:hint];
+    NSMenuItem *shortcutHint = [[NSMenuItem alloc] initWithTitle:@"Dùng phím tắt macOS mặc định Control + mũi tên" action:nil keyEquivalent:@""];
+    shortcutHint.enabled = NO;
+    [self.gestureSubmenu addItem:shortcutHint];
+    self.pauseMenuItem.title = atomic_load(&userPaused) ? @"Tiếp tục JomaaDrag" : @"Tạm dừng JomaaDrag";
+}
+
+- (void)toggleGestureOption:(NSMenuItem *)sender {
+    if (sender.tag != 0 && sender.tag != 1) return;
+    pthread_mutex_lock(&mu);
+    int value;
+    if (sender.tag == 0) {
+        value = inertiaEnabled = !inertiaEnabled;
+        if (!value && mosPhaseState == 2) stopMosScrollImmediately(0);
+    } else {
+        value = fourFingerGesturesEnabled = !fourFingerGesturesEnabled;
+        resetFourFingerGesture();
+        dragArmed = 0;
+        dragArmDx = dragArmDy = 0.0;
+    }
+    pthread_mutex_unlock(&mu);
+    [[NSUserDefaults standardUserDefaults] setBool:value forKey:
+        sender.tag == 0 ? @"ScrollInertiaEnabled" : @"FourFingerGesturesEnabled"];
+    [self updateGestureMenuUI];
+}
+
+- (void)togglePause:(id)sender {
+    (void)sender;
+    setUserPaused(!atomic_load(&userPaused));
+    [self updateGestureMenuUI];
+    [self onPollTimer];
 }
 
 - (void)updateSensitivityMenuUI {
@@ -1640,7 +1808,7 @@ static void requestTermination(int signo) {
 - (void)onPollTimer {
     if (atomic_load(&stopRequested) || atomic_load(&engineSuspended)) return;
     BOOL ready = trySetupEventTap();
-    self.statusMenuItem.title = !multitouchAPIReady()
+    self.statusMenuItem.title = atomic_load(&userPaused) ? @"Trạng thái: Đã tạm dừng ⏸" : !multitouchAPIReady()
         ? @"Trạng thái: Không thể tải driver cảm ứng ⚠️"
         : (ready ? @"Trạng thái: Đang hoạt động 🟢" : @"Trạng thái: Cần cấp quyền Trợ năng ⚠️");
 

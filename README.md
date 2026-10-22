@@ -8,7 +8,18 @@
 
 ---
 
-## Current release: 15.1
+## Current release: 15.2
+
+Version 15.2 adds touch-to-stop momentum, a momentum toggle, pause/resume and
+optional four-finger Mission Control/App Exposé/desktop gestures. Open the menu
+bar icon → **Cử chỉ Trackpad** to configure them. Four-finger gestures default
+to disabled and use the standard macOS Control-arrow shortcuts.
+
+Run `make test` for 19 gesture/lifecycle regression scenarios, and `make build`
+to build without installing. See [CHANGES-15.2.md](CHANGES-15.2.md) for defaults,
+compatibility details and [the REA inspection](docs/REA-AUDIT.md).
+
+## Preserved release: 15.1
 
 The `release/15.1-current` branch preserves the source of the installed 15.1
 application, including two-axis scrolling, browser swipes, Option Dash, pinch

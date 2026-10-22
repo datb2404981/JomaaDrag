@@ -12,6 +12,8 @@ static CGError ignoreWarp(CGPoint point);
 static CGError ignoreAssociation(boolean_t connected);
 static CGEventSourceRef privateEventSource(CGEventSourceStateID state);
 static int simulatedClock(clockid_t clock, struct timespec *ts);
+static CGEventFlags simulatedFlags(CGEventSourceStateID state);
+static CGEventFlags heldFlags;
 
 // Every event injection and cursor write is intercepted. No app is launched.
 #define CGEventPost recordEvent
@@ -19,10 +21,12 @@ static int simulatedClock(clockid_t clock, struct timespec *ts);
 #define CGAssociateMouseAndMouseCursorPosition ignoreAssociation
 #define CGEventSourceCreate privateEventSource
 #define clock_gettime simulatedClock
+#define CGEventSourceFlagsState simulatedFlags
 #define main jomaaApplicationMain
 #include "../src/main.m"
 #undef main
 #undef clock_gettime
+#undef CGEventSourceFlagsState
 #undef CGEventSourceCreate
 #undef CGAssociateMouseAndMouseCursorPosition
 #undef CGWarpMouseCursorPosition
@@ -32,6 +36,9 @@ typedef struct {
     CGEventType type;
     int64_t phase;
     int64_t momentum;
+    int64_t key;
+    CGEventFlags flags;
+    int64_t x, y;
 } RecordedEvent;
 static RecordedEvent events[8192];
 static size_t eventCount;
@@ -46,7 +53,11 @@ static void recordEvent(CGEventTapLocation location, CGEventRef event) {
     events[eventCount++] = (RecordedEvent){
         CGEventGetType(event),
         CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase),
-        CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase)
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase),
+        CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode),
+        CGEventGetFlags(event),
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2),
+        CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1)
     };
 }
 
@@ -63,6 +74,10 @@ static int simulatedClock(clockid_t clock, struct timespec *ts) {
     ts->tv_nsec = (long)((seconds - ts->tv_sec) * 1e9);
     return 0;
 }
+static CGEventFlags simulatedFlags(CGEventSourceStateID state) {
+    (void)state;
+    return heldFlags;
+}
 
 static void resetFixture(void) {
     stopDrag("test reset");
@@ -71,7 +86,12 @@ static void resetFixture(void) {
     atomic_store(&stopRequested, 0);
     atomic_store(&eventPipelineReady, 1);
     atomic_store(&engineSuspended, 0);
+    atomic_store(&userPaused, 0);
     atomic_store(&sensitivityMultiplier, 1.0);
+    atomic_store(&naturalScrollingSetting, 1);
+    inertiaEnabled = 1;
+    fourFingerGesturesEnabled = 0;
+    heldFlags = 0;
     terminationRequested = 0;
     acceptingTouches = 1;
     connectedDeviceRef = fakeDevice;
@@ -299,6 +319,218 @@ static void testIdempotentShutdown(void) {
     verifyMouseOrder();
 }
 
+static void startScroll(MTTouch *touches, int horizontal) {
+    makeTouches(touches, 2, 0.0);
+    sendTouches(touches, 2, 1000.0);
+    for (int frame = 1; frame <= 2; frame++) {
+        for (int i = 0; i < 2; i++) {
+            if (horizontal) touches[i].normalized.pos.x += 0.008;
+            else touches[i].normalized.pos.y += 0.008;
+        }
+        sendTouches(touches, 2, 1000.0 + frame * 10.0);
+    }
+    tick(NULL, NULL);
+    assert(twoFingerMode == 1 && mosPhaseState == 1);
+}
+
+static void launchFling(void) {
+    sendTouches(NULL, 0, 1025.0);
+    atomic_store(&fakeTime, 1060.0);
+    tick(NULL, NULL);
+}
+
+static void testMomentumBrakeOnStationaryContact(void) {
+    resetFixture();
+    MTTouch touches[2];
+    startScroll(touches, 0);
+    launchFling();
+    assert(mosPhaseState == 2);
+    size_t beforeBrake = eventCount;
+    makeTouches(touches, 1, 0.0);
+    sendTouches(touches, 1, 1065.0);
+    assert(mosPhaseState == 0 && mosVelocityPerTickY == 0.0);
+    assert(eventCount == beforeBrake + 1);
+    assert(events[eventCount - 1].momentum == kCGMomentumScrollPhaseEnd);
+    atomic_store(&fakeTime, 1070.0);
+    tick(NULL, NULL);
+    assert(eventCount == beforeBrake + 1);
+}
+
+static void testAllUpDoesNotBrakeMomentum(void) {
+    resetFixture();
+    MTTouch touches[2];
+    startScroll(touches, 0);
+    launchFling();
+    assert(mosPhaseState == 2);
+    size_t before = eventCount;
+    sendTouches(NULL, 0, 1065.0);
+    tick(NULL, NULL);
+    assert(mosPhaseState == 2 && eventCount > before);
+    assert(events[eventCount - 1].momentum == kCGMomentumScrollPhaseContinue);
+    // A report after a lost all-up frame must also brake immediately.
+    prevCount = 2;
+    sendTouches(touches, 1, 1070.0);
+    assert(mosPhaseState == 0);
+}
+
+static void testInertiaDisabledStillScrolls(void) {
+    resetFixture();
+    inertiaEnabled = 0;
+    MTTouch touches[2];
+    startScroll(touches, 0);
+    assert(events[0].phase == kCGScrollPhaseBegan && events[0].y != 0);
+    launchFling();
+    assert(mosPhaseState == 0 && mosVelocityPerTickY == 0.0);
+    for (size_t i = 0; i < eventCount; i++) assert(events[i].momentum == 0);
+    assert(events[eventCount - 1].phase == kCGScrollPhaseEnded);
+}
+
+static void testRestingFingersDoNotLaunchStaleVelocity(void) {
+    resetFixture();
+    MTTouch touches[2];
+    startScroll(touches, 0);
+    for (int frame = 1; frame <= 20; frame++) {
+        sendTouches(touches, 2, 1020.0 + frame * 10.0);
+        tick(NULL, NULL);
+    }
+    sendTouches(NULL, 0, 1225.0);
+    atomic_store(&fakeTime, 1260.0);
+    tick(NULL, NULL);
+    assert(mosPhaseState == 0);
+    for (size_t i = 0; i < eventCount; i++) assert(events[i].momentum == 0);
+}
+
+static void testFourFingerDirectionsAndOneShot(void) {
+    const double deltas[4][2] = {{0.06, 0}, {-0.06, 0}, {0, 0.06}, {0, -0.06}};
+    const int keys[4] = {123, 124, 126, 125};
+    for (int direction = 0; direction < 4; direction++) {
+        resetFixture();
+        fourFingerGesturesEnabled = 1;
+        heldFlags = kCGEventFlagMaskCommand | kCGEventFlagMaskShift | kCGEventFlagMaskAlternate;
+        MTTouch touches[4];
+        makeTouches(touches, 4, 0);
+        sendTouches(touches, 4, 1000.0);
+        for (int i = 0; i < 4; i++) {
+            touches[i].normalized.pos.x += deltas[direction][0];
+            touches[i].normalized.pos.y += deltas[direction][1];
+        }
+        sendTouches(touches, 4, 1010.0);
+        assert(eventCount == 2 && !atomic_load(&dragging));
+        assert(events[0].type == kCGEventKeyDown && events[1].type == kCGEventKeyUp);
+        assert(events[0].key == keys[direction] && events[1].key == keys[direction]);
+        assert(events[0].flags == kCGEventFlagMaskControl);
+        sendTouches(touches, 4, 1020.0);
+        sendTouches(touches, 3, 1030.0);
+        for (int i = 0; i < 3; i++) touches[i].normalized.pos.x += 0.002;
+        sendTouches(touches, 3, 1040.0);
+        assert(eventCount == 2 && !atomic_load(&dragging));
+        sendTouches(touches, 1, 1050.0);
+        sendTouches(NULL, 0, 1060.0);
+        assert(!fourFingerClaimed && !atomic_load(&multiTouchActive));
+    }
+}
+
+static void testFourFingerRejectsJitterAndReplacement(void) {
+    resetFixture();
+    fourFingerGesturesEnabled = 1;
+    MTTouch touches[4];
+    makeTouches(touches, 4, 0);
+    sendTouches(touches, 4, 1000.0);
+    for (int i = 0; i < 4; i++) touches[i].normalized.pos.x += 0.002;
+    sendTouches(touches, 4, 1010.0);
+    touches[3].identifier = 90;
+    touches[3].normalized.pos.x += 0.08;
+    sendTouches(touches, 4, 1020.0);
+    assert(eventCount == 0 && fourFingerDx == 0.0);
+    for (int i = 0; i < 4; i++) {
+        touches[i].normalized.pos.x += 0.06;
+        touches[i].normalized.pos.y += 0.06;
+    }
+    sendTouches(touches, 4, 1030.0);
+    assert(eventCount == 0 && !atomic_load(&dragging));
+    // Missing lift must eventually clear the recognizer.
+    atomic_store(&fakeTime, 1500.0);
+    tick(NULL, NULL);
+    assert(!fourFingerClaimed && prevCount == 0);
+}
+
+static void testFourFingerPreservesDragAndDefault(void) {
+    resetFixture();
+    MTTouch touches[4];
+    makeTouches(touches, 4, 0);
+    sendTouches(touches, 4, 1000.0);
+    makeTouches(touches, 4, 0.002);
+    sendTouches(touches, 4, 1010.0);
+    assert(atomic_load(&dragging) && !fourFingerClaimed);
+    stopDrag("default four fingers still drag");
+    verifyMouseOrder();
+    resetFixture();
+    fourFingerGesturesEnabled = 1;
+    startDrag(touches);
+    makeTouches(touches, 4, 0.001);
+    sendTouches(touches, 4, 1020.0);
+    assert(atomic_load(&dragging) && !fourFingerClaimed);
+    stopDrag("fourth finger must not steal existing drag");
+    verifyMouseOrder();
+}
+
+static void testPauseClosesGesturesAndPassesPhysicalInput(void) {
+    resetFixture();
+    MTTouch touches[3];
+    startDrag(touches);
+    setUserPaused(1);
+    assert(!atomic_load(&dragging) && !acceptingTouches && atomic_load(&userPaused));
+    verifyMouseOrder();
+    size_t afterPause = eventCount;
+    sendTouches(touches, 3, 1030.0);
+    tick(NULL, NULL);
+    assert(eventCount == afterPause);
+    CGEventRef physical = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitPixel, 2, 10, 0, 0);
+    CGEventSetIntegerValueField(physical, kCGScrollWheelEventIsContinuous, 1);
+    atomic_store(&multiTouchActive, 1);
+    atomic_store(&lastMultiTouchT, nowMs());
+    assert(mouseEventTap(NULL, kCGEventScrollWheel, physical, NULL) == physical);
+    CFRelease(physical);
+    setUserPaused(0);
+    assert(!atomic_load(&userPaused) && !acceptingTouches);
+    // Resume requires a fresh attachment, rather than stale touch history.
+    acceptingTouches = 1;
+    connectedDeviceRef = fakeDevice;
+    sendTouches(touches, 3, 1040.0);
+    assert(!atomic_load(&dragging));
+    touches[0].normalized.pos.x += 0.002;
+    touches[1].normalized.pos.x += 0.002;
+    touches[2].normalized.pos.x += 0.002;
+    sendTouches(touches, 3, 1050.0);
+    assert(atomic_load(&dragging));
+    stopDrag("resume complete");
+    verifyMouseOrder();
+}
+
+static void testExistingScrollZoomAndMousePassthrough(void) {
+    resetFixture();
+    heldFlags = kCGEventFlagMaskAlternate;
+    MTTouch touches[2];
+    startScroll(touches, 1);
+    assert(mosDashMomentum && events[0].x != 0 && events[0].y == 0);
+    stopDrag("close browser swipe");
+    assert(!mosHorizontalSwipeActive);
+    resetFixture();
+    makeTouches(touches, 2, 0);
+    sendTouches(touches, 2, 1000.0);
+    touches[0].normalized.pos.x -= 0.008;
+    touches[1].normalized.pos.x += 0.008;
+    sendTouches(touches, 2, 1010.0);
+    tick(NULL, NULL);
+    assert(twoFingerMode == 2 && zoomPhaseState == 1 && events[0].type == (CGEventType)29);
+    CGEventRef mouseWheel = CGEventCreateScrollWheelEvent2(NULL, kCGScrollEventUnitLine, 1, 1, 0, 0);
+    assert(CGEventGetIntegerValueField(mouseWheel, kCGScrollWheelEventIsContinuous) == 0);
+    assert(mouseEventTap(NULL, kCGEventScrollWheel, mouseWheel, NULL) == mouseWheel);
+    CFRelease(mouseWheel);
+    stopDrag("close pinch");
+    assert(zoomPhaseState == 0);
+}
+
 int main(void) {
     @autoreleasepool {
         testFingerReplacementAndDropout();
@@ -310,8 +542,17 @@ int main(void) {
         testInvalidInputAndPermissionGate();
         testSleepBlocksInputAndPolling();
         testConcurrentEventOrdering();
+        testMomentumBrakeOnStationaryContact();
+        testAllUpDoesNotBrakeMomentum();
+        testInertiaDisabledStillScrolls();
+        testRestingFingersDoNotLaunchStaleVelocity();
+        testFourFingerDirectionsAndOneShot();
+        testFourFingerRejectsJitterAndReplacement();
+        testFourFingerPreservesDragAndDefault();
+        testPauseClosesGesturesAndPassesPhysicalInput();
+        testExistingScrollZoomAndMousePassthrough();
         testIdempotentShutdown();
-        puts("PASS: 10 gesture/lifecycle regression scenarios (no system input injected)");
+        puts("PASS: 19 gesture/lifecycle regression scenarios (no system input injected)");
     }
     return 0;
 }

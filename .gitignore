@@ -20,3 +20,6 @@ Icon
 .idea/
 *.xcworkspace
 *.xcuserdatad
+
+# Local analysis evidence
+evidence/
