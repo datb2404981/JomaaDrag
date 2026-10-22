@@ -448,7 +448,7 @@ static void testFourFingerRejectsJitterAndReplacement(void) {
     touches[3].identifier = 90;
     touches[3].normalized.pos.x += 0.08;
     sendTouches(touches, 4, 1020.0);
-    assert(eventCount == 0 && fourFingerDx == 0.0);
+    assert(eventCount == 0 && fabs(fourFingerDx) < 0.005);
     for (int i = 0; i < 4; i++) {
         touches[i].normalized.pos.x += 0.06;
         touches[i].normalized.pos.y += 0.06;
@@ -594,6 +594,66 @@ static void testConfiguredWorkspaceShortcuts(void) {
     for (int i = 0; i < 4; i++) assert(!parseWorkspaceShortcut(malformed[i], @"32", 126).enabled);
 }
 
+static void testFourFingerBriefDropout(void) {
+    resetFixture();
+    fourFingerGesturesEnabled = 1;
+    MTTouch touches[4];
+    makeTouches(touches, 4, 0);
+    sendTouches(touches, 4, 1000.0);
+    // Observed hardware pattern: four contacts appear briefly, then one
+    // reports state 7 while the other three keep moving.
+    for (int i=0;i<3;i++) touches[i].normalized.pos.x += 0.03;
+    touches[3].state=7;
+    sendTouches(touches, 4, 1030.0);
+    assert(fourFingerClaimed && !fourFingerFired && eventCount == 0);
+    for (int i=0;i<3;i++) touches[i].normalized.pos.x += 0.03;
+    sendTouches(touches, 4, 1060.0);
+    assert(fourFingerFired && !atomic_load(&dragging));
+    assert(eventCount == 2 && events[0].key == 123);
+    sendTouches(touches, 3, 1090.0);
+    assert(eventCount == 2);
+    sendTouches(NULL, 0, 1100.0);
+    assert(!fourFingerClaimed);
+}
+
+static void testFourFingerDropoutExpiry(void) {
+    resetFixture();
+    fourFingerGesturesEnabled=1;
+    MTTouch touches[4];
+    makeTouches(touches,4,0);
+    sendTouches(touches,4,1000.0);
+    makeTouches(touches,3,0.06);
+    sendTouches(touches,3,1200.0);
+    assert(eventCount == 0 && fourFingerClaimed && !fourFingerFired);
+    makeTouches(touches,3,0.12);
+    sendTouches(touches,3,1230.0);
+    assert(eventCount == 0 && !atomic_load(&dragging));
+    sendTouches(NULL,0,1240.0);
+}
+
+static void testFourthContactWithInvalidCoordinate(void) {
+    resetFixture();
+    fourFingerGesturesEnabled=1;
+    MTTouch touches[4];
+    makeTouches(touches,4,0);
+    touches[3].normalized.pos.x=NAN;
+    sendTouches(touches,4,1000.0);
+    assert(fourFingerClaimed && prevCount == 3);
+    for (int i=0;i<3;i++) touches[i].normalized.pos.x += 0.06;
+    sendTouches(touches,4,1030.0);
+    assert(eventCount == 2 && events[0].key == 123);
+    sendTouches(NULL,0,1040.0);
+    resetFixture();
+    fourFingerGesturesEnabled=1;
+    makeTouches(touches,3,0);
+    touches[2].normalized.pos.x=NAN;
+    sendTouches(touches,3,1000.0);
+    for (int i=0;i<2;i++) touches[i].normalized.pos.x += 0.06;
+    sendTouches(touches,3,1030.0);
+    assert(!fourFingerClaimed);
+    for (size_t i=0;i<eventCount;i++) assert(events[i].type != kCGEventKeyDown);
+}
+
 int main(void) {
     @autoreleasepool {
         testFingerReplacementAndDropout();
@@ -616,8 +676,11 @@ int main(void) {
         testExistingScrollZoomAndMousePassthrough();
         testStaggeredFourFingerLandingDoesNotStartDrag();
         testConfiguredWorkspaceShortcuts();
+        testFourFingerBriefDropout();
+        testFourFingerDropoutExpiry();
+        testFourthContactWithInvalidCoordinate();
         testIdempotentShutdown();
-        puts("PASS: 21 gesture/lifecycle regression scenarios (no system input injected)");
+        puts("PASS: 24 gesture/lifecycle regression scenarios (no system input injected)");
     }
     return 0;
 }

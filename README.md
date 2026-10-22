@@ -8,7 +8,11 @@
 
 ---
 
-## Current release: 15.2.1
+## Current release: 15.2.2
+
+Version 15.2.2 tolerates brief fourth-finger dropouts observed on a physical Jomaa
+trackpad. The user confirmed working gestures after installation. See
+[CHANGES-15.2.2.md](CHANGES-15.2.2.md) for the diagnosis and verification scope.
 
 Version 15.2.1 fixes staggered four-finger recognition and reads your actual
 macOS Mission Control keyboard shortcuts, including custom mappings. The menu
@@ -20,7 +24,7 @@ optional four-finger Mission Control/App Exposé/desktop gestures. Open the menu
 bar icon → **Cử chỉ Trackpad** to configure them. Four-finger gestures default
 to disabled and use the configured macOS Mission Control shortcuts.
 
-Run `make test` for 21 gesture/lifecycle regression scenarios, and `make build`
+Run `make test` for 24 gesture/lifecycle regression scenarios, and `make build`
 to build without installing. See [CHANGES-15.2.md](CHANGES-15.2.md) for defaults,
 compatibility details and [the REA inspection](docs/REA-AUDIT.md).
 

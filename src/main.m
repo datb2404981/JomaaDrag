@@ -148,6 +148,8 @@ static int fourFingerGesturesEnabled = 0;
 static int fourFingerClaimed = 0;
 static int fourFingerFired = 0;
 static double fourFingerDx = 0.0, fourFingerDy = 0.0;
+static double lastFourFingerEvidenceT = 0.0;
+static int64_t lastFourFingerDragWarning = 0;
 static _Atomic int maximumFingerCount = 0;
 
 typedef struct {
@@ -208,6 +210,7 @@ static void refreshWorkspaceShortcuts(void) {
 static void resetFourFingerGesture(void) {
     fourFingerClaimed = fourFingerFired = 0;
     fourFingerDx = fourFingerDy = 0.0;
+    lastFourFingerEvidenceT = 0.0;
 }
 
 static inline double nowMs(void) {
@@ -682,9 +685,21 @@ static int emitWorkspaceShortcut(int direction) {
 
 // A claimed four-finger gesture owns its trailing 3/2/1 contacts until lift.
 // Adding a fourth finger to an established drag never steals that drag.
-static int handleFourFingerGesture(const TouchPos *touches, int count, double tn) {
-    if (!fourFingerGesturesEnabled || atomic_load(&dragging)) return 0;
-    if (!fourFingerClaimed && count != 4) return 0;
+static int handleFourFingerGesture(const TouchPos *touches, int count, int reportedActiveCount, double tn) {
+    if (!fourFingerGesturesEnabled) return 0;
+    if (atomic_load(&dragging)) {
+        if (reportedActiveCount == 4 && lastFourFingerDragWarning != dragEventNumber) {
+            lastFourFingerDragWarning = dragEventNumber;
+            fprintf(stderr, "[JomaaDrag] 4-finger: đủ ngón nhưng phiên kéo 3 ngón đã bắt đầu.\n");
+        }
+        return 0;
+    }
+    // Presence and movement have separate validity requirements: a fourth
+    // contact with a bad coordinate can establish presence, while three valid
+    // contacts still provide a safe, ID-matched displacement.
+    int fourPresent = reportedActiveCount == 4 && count >= 3;
+    if (!fourFingerClaimed && !fourPresent) return 0;
+    if (fourPresent) lastFourFingerEvidenceT = tn;
     if (!fourFingerClaimed) {
         fourFingerClaimed = 1;
         fprintf(stderr, "[JomaaDrag] 4-finger: nhận đủ 4 ngón.\n");
@@ -694,9 +709,10 @@ static int handleFourFingerGesture(const TouchPos *touches, int count, double tn
         dragArmed = 0;
         dragArmDx = dragArmDy = 0.0;
         dragArmSinceT = 0.0;
-    } else if (count == 4 && prevCount == 4 && !fourFingerFired) {
+    } else if (count >= 3 && prevCount >= 3 && !fourFingerFired &&
+               tn - lastFourFingerEvidenceT <= 180.0) {
         double dx = 0.0, dy = 0.0;
-        if (computeMatchedFingerDelta(touches, count, prevTouches, prevCount, &dx, &dy) == 4) {
+        if (computeMatchedFingerDelta(touches, count, prevTouches, prevCount, &dx, &dy) >= 2) {
             fourFingerDx += dx;
             fourFingerDy += dy;
             double ax = fabs(fourFingerDx), ay = fabs(fourFingerDy);
@@ -735,8 +751,10 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
 
     TouchPos currTouches[MAX_TOUCHES];
     int currCount = 0;
+    int reportedActiveCount = 0;
     for (int i = 0; i < n && currCount < MAX_TOUCHES; i++) {
         int st = t[i].state;
+        if (st >= 1 && st <= 4) reportedActiveCount++;
         if (st >= 1 && st <= 4 && isfinite(t[i].normalized.pos.x) &&
             isfinite(t[i].normalized.pos.y) && t[i].normalized.pos.x >= 0.0f &&
             t[i].normalized.pos.x <= 1.0f && t[i].normalized.pos.y >= 0.0f &&
@@ -752,9 +770,9 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
         }
     }
     latestPresent = currCount;
-    if (currCount > atomic_load(&maximumFingerCount)) {
-        atomic_store(&maximumFingerCount, currCount);
-        fprintf(stderr, "[JomaaDrag] Cảm ứng: đã nhận tối đa %d ngón.\n", currCount);
+    if (reportedActiveCount > atomic_load(&maximumFingerCount)) {
+        atomic_store(&maximumFingerCount, reportedActiveCount);
+        fprintf(stderr, "[JomaaDrag] Cảm ứng: tối đa %d ngón thô, %d tọa độ hợp lệ.\n", reportedActiveCount, currCount);
     }
 
     if (currCount > 0) {
@@ -767,7 +785,7 @@ static int touchCallback(MTDeviceRef d, MTTouch *t, int n, double ts, int frame)
     if (currCount > 0 && mosPhaseState == 2) {
         stopMosScrollImmediately(0);
     }
-    if (handleFourFingerGesture(currTouches, currCount, tn)) {
+    if (handleFourFingerGesture(currTouches, currCount, reportedActiveCount, tn)) {
         prevCount = currCount;
         for (int i = 0; i < currCount; i++) prevTouches[i] = currTouches[i];
         pthread_mutex_unlock(&mu);
@@ -1568,7 +1586,7 @@ static void setUserPaused(int paused) {
 
     NSMenu *menu = [[NSMenu alloc] init];
 
-    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"15.2.1";
+    NSString *version = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"15.2.2";
     NSMenuItem *header = [[NSMenuItem alloc] initWithTitle:[@"JomaaDrag v" stringByAppendingString:version] action:nil keyEquivalent:@""];
     [header setEnabled:NO];
     [menu addItem:header];
